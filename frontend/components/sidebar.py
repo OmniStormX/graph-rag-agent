@@ -1,5 +1,5 @@
 import streamlit as st
-from utils.api import clear_chat
+from utils.api import clear_chat, clear_agent_cache
 from frontend_config.settings import examples
 
 def display_sidebar():
@@ -116,3 +116,9 @@ def display_sidebar():
         # 重置按钮
         if st.button("🗑️ 清除对话历史", key="clear_chat"):
             clear_chat()
+        if st.button("♻️ 清空当前 Agent 缓存", key="clear_agent_cache"):
+            result = clear_agent_cache()
+            if result and result.get("status") == "success":
+                st.success(result.get("message", "缓存已清除"))
+            else:
+                st.error(result.get("message", "清除缓存失败"))

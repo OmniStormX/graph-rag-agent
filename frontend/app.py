@@ -1,6 +1,8 @@
 import streamlit as st
 
-from utils.state import init_session_state
+from utils.state import (
+    init_session_state,
+)
 from components.styles import custom_css
 from components.chat import display_chat_interface
 from components.sidebar import display_sidebar

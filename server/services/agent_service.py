@@ -120,6 +120,56 @@ class AgentManager:
             # 清空实例池
             self.agent_instances.clear()
 
+    def clear_agent_cache(self, session_id: str, agent_type: str | None = None) -> Dict:
+        """
+        清除指定会话下 Agent 的缓存。
+
+        Args:
+            session_id: 会话ID
+            agent_type: 可选，指定单个 Agent；为空时清除该会话下所有 Agent 的缓存
+
+        Returns:
+            Dict: 清理结果
+        """
+        cleared_agents = []
+
+        with self.agent_lock:
+            target_agent_types = [agent_type] if agent_type else list(self.agent_classes.keys())
+
+            for current_agent_type in target_agent_types:
+                instance_key = f"{current_agent_type}:{session_id}"
+                agent = self.agent_instances.get(instance_key)
+                if agent is None:
+                    continue
+
+                try:
+                    # BaseAgent 体系缓存
+                    if hasattr(agent, "cache_manager"):
+                        agent.cache_manager.clear()
+                    if hasattr(agent, "global_cache_manager"):
+                        agent.global_cache_manager.clear()
+
+                    # FusionAgent 的轻量内存缓存
+                    if hasattr(agent, "_session_cache") and isinstance(agent._session_cache, dict):
+                        agent._session_cache.pop(session_id, None)
+                    if hasattr(agent, "_global_cache") and isinstance(agent._global_cache, dict):
+                        agent._global_cache.clear()
+
+                    cleared_agents.append(current_agent_type)
+                except Exception as e:
+                    print(f"清除 {current_agent_type} 缓存时出错: {e}")
+
+        if not cleared_agents:
+            return {
+                "status": "success",
+                "message": "未找到可清理的缓存实例"
+            }
+
+        return {
+            "status": "success",
+            "message": f"已清除缓存: {', '.join(cleared_agents)}"
+        }
+
 
 # 创建全局实例
 agent_manager = AgentManager()
@@ -155,7 +205,20 @@ def format_execution_log(log: List[Dict]) -> List[Dict]:
     """
     formatted_log = []
     for entry in log:
-        formatted_entry = {"node": entry["node"]}
+        if not isinstance(entry, dict):
+            formatted_log.append({
+                "node": "unknown",
+                "output": str(entry),
+            })
+            continue
+
+        # 兼容旧日志结构和多智能体扩展结构，避免因字段缺失导致接口报错。
+        formatted_entry = {
+            "node": entry.get("node") or entry.get("worker_type") or entry.get("task_id") or "unknown"
+        }
+
+        if "timestamp" in entry:
+            formatted_entry["timestamp"] = entry["timestamp"]
         
         # 处理输入
         if "input" in entry:
@@ -206,6 +269,11 @@ def format_execution_log(log: List[Dict]) -> List[Dict]:
             else:
                 output_str = str(entry["output"])
             formatted_entry["output"] = output_str
+
+        # 对于未适配的新结构，保留关键字段，便于调试和后续治理。
+        for key in ["task_id", "record_id", "worker_type", "latency", "latency_seconds", "evidence_count", "success"]:
+            if key in entry and key not in formatted_entry:
+                formatted_entry[key] = entry[key]
         
         formatted_log.append(formatted_entry)
     return formatted_log

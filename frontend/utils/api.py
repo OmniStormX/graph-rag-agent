@@ -216,6 +216,41 @@ def send_feedback(message_id: str, query: str, is_positive: bool, thread_id: str
         st.error(f"发送反馈时出错: {str(e)}")
         return {"status": "error", "action": str(e)}
 
+
+def clear_agent_cache(agent_type: str = None):
+    """清除当前会话的 Agent 缓存，并同步清理前端本地缓存。"""
+    try:
+        payload = {
+            "session_id": st.session_state.session_id,
+            "agent_type": agent_type or st.session_state.agent_type,
+        }
+        response = requests.post(
+            f"{API_URL}/clear_cache",
+            json=payload,
+            timeout=15,
+        )
+        result = response.json()
+
+        # 同步清空前端缓存，避免继续显示旧的图谱和接口结果。
+        if "cache" in st.session_state:
+            st.session_state.cache = {
+                "source_info": {},
+                "knowledge_graphs": {},
+                "vector_search_results": {},
+                "api_responses": {},
+            }
+
+        # 清空图谱联动和调试状态，避免旧上下文残留。
+        st.session_state.selected_evidence_id = None
+        st.session_state.selected_focus_node_id = None
+        st.session_state.current_kg_message = None
+        st.session_state.kg_data = None
+
+        return result
+    except requests.exceptions.RequestException as e:
+        st.error(f"清除缓存失败: {str(e)}")
+        return {"status": "error", "message": str(e)}
+
 @monitor_performance(endpoint="get_knowledge_graph")
 def get_knowledge_graph(limit: int = 100, query: str = None) -> Dict:
     """获取知识图谱数据"""

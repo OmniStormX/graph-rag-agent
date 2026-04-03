@@ -68,8 +68,8 @@ class GraphAgent(BaseAgent):
         if not query or not isinstance(query, str):
             return {"low_level": [], "high_level": []}
         
-        # 检查缓存
-        cached_keywords = self.cache_manager.get(f"keywords:{query}")
+        # 使用独立的关键词缓存，避免与回答缓存混用。
+        cached_keywords = self._keyword_cache.get(query)
         if cached_keywords:
             return cached_keywords
             
@@ -98,7 +98,7 @@ class GraphAgent(BaseAgent):
                         keywords["high_level"] = []
                         
                     # 缓存结果
-                    self.cache_manager.set(f"keywords:{query}", keywords)
+                    self._keyword_cache[query] = keywords
                     return keywords
                 except:
                     pass
@@ -176,7 +176,7 @@ class GraphAgent(BaseAgent):
 
         # 首先尝试全局缓存
         global_result = self.global_cache_manager.get(question)
-        if global_result:
+        if self._is_valid_text_response(global_result):
             self._log_execution("generate", 
                             {"question": question, "docs_length": len(docs)}, 
                             "全局缓存命中")
@@ -185,7 +185,7 @@ class GraphAgent(BaseAgent):
         # 然后检查会话缓存
         thread_id = state.get("configurable", {}).get("thread_id", "default")
         cached_result = self.cache_manager.get(question, thread_id=thread_id)
-        if cached_result:
+        if self._is_valid_text_response(cached_result):
             self._log_execution("generate", 
                             {"question": question, "docs_length": len(docs)}, 
                             "会话缓存命中")
@@ -226,7 +226,7 @@ class GraphAgent(BaseAgent):
 
         # 检查缓存
         cached_result = self.cache_manager.get(f"reduce:{question}")
-        if cached_result:
+        if self._is_valid_text_response(cached_result):
             self._log_execution("reduce", 
                                {"question": question, "docs_length": len(docs)}, 
                                cached_result)

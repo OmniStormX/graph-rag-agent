@@ -4,11 +4,17 @@ import re
 import json
 import traceback
 from utils.api import send_message, send_feedback, get_source_content, get_knowledge_graph_from_message, get_source_file_info_batch, clear_chat, send_message_stream
-from utils.helpers import extract_source_ids
+from utils.helpers import extract_source_ids, render_answer_with_hover_citations
 
 def reset_processing_lock():
     """重置处理锁状态"""
     st.session_state.processing_lock = False
+
+
+def render_assistant_markdown(content: str):
+    """渲染带证据引用悬停样式的回答内容。"""
+    rendered_content = render_answer_with_hover_citations(content)
+    st.markdown(rendered_content, unsafe_allow_html=True)
 
 def display_chat_interface():
     """显示主聊天界面"""
@@ -122,7 +128,7 @@ def display_chat_interface():
                         st.markdown("\n\n")
                         
                         # 显示答案
-                        st.markdown(answer_content)
+                        render_assistant_markdown(answer_content)
                     # 检查是否有<think>标签
                     elif "<think>" in content and "</think>" in content:
                         # 提取<think>标签中的内容
@@ -146,17 +152,17 @@ def display_chat_interface():
                                 st.markdown("\n\n")
                                 
                                 # 显示答案
-                                st.markdown(answer_content)
+                                render_assistant_markdown(answer_content)
                             else:
                                 # 只显示答案部分（不显示思考过程）
-                                st.markdown(answer_content)
+                                render_assistant_markdown(answer_content)
                         else:
                             # 如果提取失败，显示完整内容但移除可能的<think>标签
                             cleaned_content = re.sub(r'<think>|</think>', '', content)
-                            st.markdown(cleaned_content)
+                            render_assistant_markdown(cleaned_content)
                     else:
                         # 普通回答，无思考过程
-                        st.markdown(content)
+                        render_assistant_markdown(content)
                 else:
                     # 普通消息直接显示
                     st.markdown(content)
@@ -373,7 +379,8 @@ def display_chat_interface():
                                     # 添加到完整响应
                                     full_response += token
                                     # 在占位符中显示，添加光标模拟打字效果
-                                    message_placeholder.markdown(full_response + "▌")
+                                    rendered_response = render_answer_with_hover_citations(full_response)
+                                    message_placeholder.markdown(rendered_response + "▌", unsafe_allow_html=True)
                             except Exception as e:
                                 print(f"处理令牌出错: {str(e)}")
                         
@@ -387,16 +394,25 @@ def display_chat_interface():
                                     response = send_message(prompt)
                                     if response:
                                         full_response = response.get("answer", "")
-                                        message_placeholder.markdown(full_response)
+                                        message_placeholder.markdown(
+                                            render_answer_with_hover_citations(full_response),
+                                            unsafe_allow_html=True,
+                                        )
                             except Exception as e:
                                 print(f"流式API失败: {str(e)}")
                                 response = send_message(prompt)
                                 if response:
                                     full_response = response.get("answer", "")
-                                    message_placeholder.markdown(full_response)
+                                    message_placeholder.markdown(
+                                        render_answer_with_hover_citations(full_response),
+                                        unsafe_allow_html=True,
+                                    )
                         
                         # 最后一次更新，移除光标
-                        message_placeholder.markdown(full_response)
+                        message_placeholder.markdown(
+                            render_answer_with_hover_citations(full_response),
+                            unsafe_allow_html=True,
+                        )
                         
                         # 创建消息对象
                         message_obj = {
@@ -418,7 +434,10 @@ def display_chat_interface():
                             answer = response.get("answer", "抱歉，我无法处理您的请求。")
                             
                             # 在占位符中显示内容
-                            message_placeholder.markdown(answer)
+                            message_placeholder.markdown(
+                                render_answer_with_hover_citations(answer),
+                                unsafe_allow_html=True,
+                            )
                             
                             # 创建消息对象
                             message_obj = {

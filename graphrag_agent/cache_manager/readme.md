@@ -433,7 +433,7 @@ CACHE_SENTENCE_TRANSFORMER_MODEL=all-MiniLM-L6-v2
 # 环境变量配置
 CACHE_EMBEDDING_PROVIDER=openai
 OPENAI_API_KEY=sk-xxx
-OPENAI_EMBEDDINGS_MODEL=text-embedding-3-large
+OPENAI_EMBEDDINGS_MODEL=text-embedding-v4
 ```
 
 **特点**：

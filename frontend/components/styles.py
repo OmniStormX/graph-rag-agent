@@ -188,6 +188,46 @@ def custom_css():
         background-color: #4CAF50;
         border-radius: 4px;
     }
+    /* 证据关键词高亮样式 */
+    .evidence-keyword-highlight {
+        position: relative;
+        display: inline-block;
+        color: #123f88;
+        font-weight: 700;
+        cursor: pointer !important;
+        text-decoration: underline;
+        text-decoration-color: rgba(18, 63, 136, 0.35);
+        text-underline-offset: 0.14rem;
+        transition: color 0.08s ease, text-decoration-color 0.08s ease;
+    }
+    .evidence-keyword-highlight:hover {
+        color: #0c2e66;
+        text-decoration-color: rgba(12, 46, 102, 0.7);
+    }
+    .evidence-keyword-highlight::after {
+        content: attr(data-evidence-id);
+        position: absolute;
+        left: 50%;
+        bottom: calc(100% + 0.32rem);
+        transform: translateX(-50%) translateY(4px);
+        opacity: 0;
+        pointer-events: none;
+        white-space: nowrap;
+        background: rgba(15, 23, 42, 0.96);
+        color: #f8fafc;
+        border-radius: 8px;
+        padding: 0.36rem 0.56rem;
+        font-size: 0.76rem;
+        font-weight: 500;
+        line-height: 1.3;
+        box-shadow: 0 8px 24px rgba(15, 23, 42, 0.18);
+        transition: opacity 0.06s ease, transform 0.06s ease;
+        z-index: 20;
+    }
+    .evidence-keyword-highlight:hover::after {
+        opacity: 1;
+        transform: translateX(-50%) translateY(0);
+    }
     </style>
     """, unsafe_allow_html=True)
 

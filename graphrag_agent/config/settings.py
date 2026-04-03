@@ -60,31 +60,59 @@ FILE_REGISTRY_PATH = PROJECT_ROOT / "file_registry.json"  # 文件注册表路�
 
 # ===== 知识库与系统参数 =====
 
-KB_NAME = "华东理工大学"  # 知识库主题，用于deepsearch
+# 默认知识库主题调整为教材与技术文档，避免图谱 schema
+# 与具体学科绑定过死，便于在讲义、教材、标准说明书中复用。
+KB_NAME = "教材与技术文档"  # 知识库主题，用于 deepsearch
 workers = _get_env_int("FASTAPI_WORKERS", 2) or 2  # FastAPI 并发进程数
 
 # ===== 知识图谱配置 =====
 
-theme = "华东理工大学学生管理"  # 知识图谱主题
+theme = "教材与技术文档知识体系"  # 知识图谱主题
 
 entity_types = [
-    "学生类型",
-    "奖学金类型",
-    "处分类型",
-    "部门",
-    "学生职责",
-    "管理规定",
+    # 文档结构类实体，便于表达“章节-小节-图表-案例”的组织关系。
+    "章节",
+    "小节",
+    "图表",
+    "案例",
+    # 知识内容类实体，覆盖教材、讲义和技术说明书中的核心知识点。
+    "概念",
+    "原理定律",
+    "物理量",
+    "公式",
+    "变量",
+    "条件",
+    "过程",
+    "状态",
+    "系统对象",
+    "组成部件",
+    "材料介质",
+    # 兜底类型，减少 LLM 因 schema 过窄导致的误分类。
+    "其它",
 ]  # 知识图谱实体类型
 
 relationship_types = [
-    "申请",
-    "评选",
-    "违纪",
-    "资助",
-    "申诉",
-    "管理",
-    "权利义务",
-    "互斥",
+    # 结构关系。
+    "包含",
+    "属于",
+    # 语义关系。
+    "定义",
+    "遵循",
+    "表示",
+    "使用变量",
+    "单位为",
+    "适用条件",
+    # 机理关系。
+    "导致",
+    "影响",
+    "依赖",
+    "具有状态",
+    # 辅助说明关系。
+    "图示说明",
+    "实例说明",
+    "对比",
+    # 兜底关系，需放在最后一位，与提示词约束保持一致。
+    "其它",
 ]  # 知识图谱关系类型
 
 # 冲突解决策略：manual_first / auto_first / merge
@@ -107,22 +135,24 @@ response_type = os.getenv("RESPONSE_TYPE", "多个段落")  # 默认回答形式
 # ===== Agent 工具描述 =====
 
 lc_description = (
-    "用于需要具体细节的查询。检索华东理工大学学生管理文件中的具体规定、条款、流程等详细内容。"
-    "适用于'某个具体规定是什么'、'处理流程如何'等问题。"
+    "用于需要具体知识点与局部证据的查询。检索教材、讲义和技术文档中的定义、公式、变量含义、"
+    "适用条件、组成结构、实验条件与图表说明等细节内容。适用于“某公式中的变量分别表示什么”"
+    "“某个过程适用于什么条件”这类问题。"
 )
 gl_description = (
-    "用于需要总结归纳的查询。分析华东理工大学学生管理体系的整体框架、管理原则、学生权利义务等宏观内容。"
-    "适用于'学校的学生管理总体思路'、'学生权益保护机制'等需要系统性分析的问题。"
+    "用于需要总结归纳的查询。分析章节结构、概念体系、原理脉络、过程链路和对象之间的整体关系，"
+    "适用于“这一章的核心知识框架是什么”“某系统由哪些关键部分构成”这类需要系统性整理的问题。"
 )
 naive_description = (
-    "基础检索工具，直接查找与问题最相关的文本片段，不做复杂分析。快速获取华东理工大学相关政策，返回最匹配的原文段落。"
+    "基础检索工具，直接查找与问题最相关的原文片段，不做复杂分析。适合快速定位术语定义、公式出处、"
+    "变量说明、案例描述和技术说明中的原文证据。"
 )
 
 examples = [
-    "旷课多少学时会被退学？",
-    "国家奖学金和国家励志奖学金互斥吗？",
-    "优秀学生要怎么申请？",
-    "那上海市奖学金呢？",
+    "牛顿第二定律中的各个变量分别表示什么？",
+    "热传导方程适用于哪些条件？",
+    "伯努利方程和连续性方程有什么区别与联系？",
+    "某章节中的系统由哪些关键组成部件构成？",
 ]  # 前端示例问题
 
 # ===== 性能优化配置 =====
@@ -168,6 +198,28 @@ TIKTOKEN_CACHE_DIR = Path(
     os.getenv("TIKTOKEN_CACHE_DIR", DEFAULT_CACHE_ROOT / "tiktoken")
 ).expanduser()
 os.environ.setdefault("TIKTOKEN_CACHE_DIR", str(TIKTOKEN_CACHE_DIR))
+
+# Hugging Face Hub 配置，主要用于 transformers tokenizer/model 下载。
+# 默认接入常见镜像站，便于在网络受限环境下完成首次拉取。
+HF_HOME = Path(
+    os.getenv("HF_HOME", DEFAULT_CACHE_ROOT / "huggingface")
+).expanduser()
+HF_HUB_CACHE = Path(
+    os.getenv("HF_HUB_CACHE", HF_HOME / "hub")
+).expanduser()
+HF_ENDPOINT = os.getenv("HF_ENDPOINT", "https://hf-mirror.com")
+HF_HUB_ETAG_TIMEOUT = str(_get_env_int("HF_HUB_ETAG_TIMEOUT", 30) or 30)
+HF_HUB_DOWNLOAD_TIMEOUT = str(
+    _get_env_int("HF_HUB_DOWNLOAD_TIMEOUT", 60) or 60
+)
+HF_HUB_OFFLINE = "1" if _get_env_bool("HF_HUB_OFFLINE", False) else "0"
+
+os.environ.setdefault("HF_HOME", str(HF_HOME))
+os.environ.setdefault("HF_HUB_CACHE", str(HF_HUB_CACHE))
+os.environ.setdefault("HF_ENDPOINT", HF_ENDPOINT)
+os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", HF_HUB_ETAG_TIMEOUT)
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", HF_HUB_DOWNLOAD_TIMEOUT)
+os.environ.setdefault("HF_HUB_OFFLINE", HF_HUB_OFFLINE)
 
 SENTENCE_TRANSFORMER_MODELS = [
     item.strip()
@@ -217,15 +269,24 @@ NEO4J_CONFIG = {
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "")
-OPENAI_EMBEDDINGS_MODEL = os.getenv("OPENAI_EMBEDDINGS_MODEL") or None
 OPENAI_LLM_MODEL = os.getenv("OPENAI_LLM_MODEL") or None
 LLM_TEMPERATURE = _get_env_float("TEMPERATURE", None)
 LLM_MAX_TOKENS = _get_env_int("MAX_TOKENS", None)
 
+# embedding 配置从通用 OpenAI 配置中独立拆出，便于接入 Qwen 等兼容接口。
+# 若未显式配置 EMBEDDING_*，则回退到原有 OPENAI_* 配置，保持向后兼容。
+EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY") or OPENAI_API_KEY
+EMBEDDING_BASE_URL = os.getenv("EMBEDDING_BASE_URL") or OPENAI_BASE_URL
+EMBEDDING_MODEL = (
+    os.getenv("EMBEDDING_MODEL")
+    or os.getenv("OPENAI_EMBEDDINGS_MODEL")
+    or None
+)
+
 OPENAI_EMBEDDING_CONFIG = {
-    "model": OPENAI_EMBEDDINGS_MODEL,
-    "api_key": OPENAI_API_KEY,
-    "base_url": OPENAI_BASE_URL,
+    "model": EMBEDDING_MODEL,
+    "api_key": EMBEDDING_API_KEY,
+    "base_url": EMBEDDING_BASE_URL,
 }
 
 OPENAI_LLM_CONFIG = {

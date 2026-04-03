@@ -50,7 +50,6 @@ def init_session_state():
         st.session_state.processing_lock = False
     if 'current_kg_message' not in st.session_state:
         st.session_state.current_kg_message = None
-    
     # 知识图谱管理相关状态
     if 'entity_to_update' not in st.session_state:
         st.session_state.entity_to_update = None

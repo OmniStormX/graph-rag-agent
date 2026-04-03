@@ -1,7 +1,14 @@
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 import json
-from models.schemas import ChatRequest, ChatResponse, ClearRequest, ClearResponse
+from models.schemas import (
+    ChatRequest,
+    ChatResponse,
+    ClearRequest,
+    ClearResponse,
+    ClearCacheRequest,
+    ClearCacheResponse,
+)
 from services.chat_service import process_chat, process_chat_stream
 from services.agent_service import agent_manager, format_execution_log
 from utils.performance import measure_performance
@@ -202,3 +209,21 @@ async def clear_chat(request: ClearRequest):
     """
     result = agent_manager.clear_history(request.session_id)
     return ClearResponse(**result)
+
+
+@router.post("/clear_cache", response_model=ClearCacheResponse)
+async def clear_cache(request: ClearCacheRequest):
+    """
+    清除指定会话下的 Agent 缓存
+
+    Args:
+        request: 清除缓存请求
+
+    Returns:
+        ClearCacheResponse: 清除缓存结果
+    """
+    result = agent_manager.clear_agent_cache(
+        session_id=request.session_id,
+        agent_type=request.agent_type,
+    )
+    return ClearCacheResponse(**result)

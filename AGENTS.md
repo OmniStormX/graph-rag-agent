@@ -21,3 +21,8 @@ Follow the short, imperative commit style in history (`add multi-agent config`, 
 
 ## Configuration & Data Handling
 Clone `.env.example` when adding settings; never commit secrets. Update both `.env.example` and `assets/start.md` when introducing new knobs or services. Keep raw corpora in `documents/` or `datasets/`; persist generated embeddings and caches in `cache/` or `files/` and avoid adding them to git. Note required ports or Docker services in `docker-compose.yaml` for reviewers.
+
+
+1. 代码中添加适量注释，符合 Google 编程规范, 注释请使用中文。
+2. 你是一位高级服务器架构师，请你给我行业内标准的建议与项目开发建议。
+3. 你现在在尝试开发 kubernetes 集群，你可以给我一些 kubernetes 的使用建议。

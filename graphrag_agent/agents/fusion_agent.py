@@ -1,5 +1,6 @@
 import asyncio
 import re
+import time
 from typing import Any, AsyncGenerator, Dict, Optional, Tuple
 
 from graphrag_agent.config.settings import AGENT_SETTINGS
@@ -41,7 +42,17 @@ class FusionGraphRAGAgent:
 
     def ask_with_trace(self, query: str, thread_id: str = "default", recursion_limit: Optional[int] = None) -> Dict[str, Any]:
         answer, payload = self._execute(query, thread_id)
-        return {"answer": answer, "payload": payload}
+        # 兼容 BaseAgent.ask_with_trace 的返回协议，避免上层服务因字段缺失报错。
+        execution_log = self._build_execution_log(payload, query)
+        return {
+            "answer": answer,
+            "execution_log": execution_log,
+            "payload": payload,
+        }
+
+    def check_fast_cache(self, query: str, thread_id: str = "default") -> Optional[str]:
+        """检查 Fusion Agent 的内存缓存，兼容现有服务层快速路径。"""
+        return self._read_cache(query, thread_id)
 
     async def ask_stream(self, query: str, thread_id: str = "default", recursion_limit: Optional[int] = None) -> AsyncGenerator[str, None]:
         cached = self._read_cache(query, thread_id)
@@ -57,11 +68,11 @@ class FusionGraphRAGAgent:
     def _execute(self, query: str, thread_id: str, *, assumptions: Optional[list[str]] = None, report_type: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
         cached = self._read_cache(query, thread_id)
         if cached is not None:
-            return cached, {"status": "cached"}
+            return cached, {"status": "cached", "execution_records": []}
         payload = self.multi_agent.process_query(query.strip(), assumptions=assumptions, report_type=report_type)
         answer = self._normalize_answer(payload.get("response"))
         self._write_cache(query, thread_id, answer)
-        self.execution_log = payload.get("execution_records", [])
+        self.execution_log = self._build_execution_log(payload, query)
         self._last_payload = payload
         return answer, payload
 
@@ -79,6 +90,64 @@ class FusionGraphRAGAgent:
         if isinstance(answer, str) and answer.strip():
             return answer.strip()
         return "未能生成回答" if answer is None else str(answer)
+
+    @staticmethod
+    def _build_execution_log(payload: Dict[str, Any], query: str) -> list[Dict[str, Any]]:
+        """将多智能体执行记录转换为服务层可直接消费的调试日志。"""
+        execution_records = payload.get("execution_records", [])
+        if execution_records:
+            formatted_logs = []
+            for record in execution_records:
+                if not isinstance(record, dict):
+                    formatted_logs.append({
+                        "node": "fusion_agent",
+                        "timestamp": time.time(),
+                        "input": query,
+                        "output": str(record),
+                    })
+                    continue
+
+                # 兼容多智能体执行记录结构，转换为旧前端可展示的调试日志格式。
+                task_id = record.get("task_id", "unknown_task")
+                worker_type = record.get("worker_type", "unknown_worker")
+                tool_names = [
+                    tool_call.get("tool_name", "unknown_tool")
+                    for tool_call in record.get("tool_calls", [])
+                    if isinstance(tool_call, dict)
+                ]
+                reflection = record.get("reflection") or {}
+                metadata = record.get("metadata") or {}
+                summary = {
+                    "task_id": task_id,
+                    "worker_type": worker_type,
+                    "tool_calls": tool_names,
+                    "evidence_count": len(record.get("evidence", [])),
+                    "latency_seconds": metadata.get("latency_seconds", 0.0),
+                    "success": reflection.get("success", True),
+                    "reasoning": reflection.get("reasoning", ""),
+                }
+                formatted_logs.append({
+                    "node": f"fusion_{worker_type}",
+                    "timestamp": record.get("created_at", time.time()),
+                    "input": {
+                        "query": query,
+                        "task_id": task_id,
+                        "worker_type": worker_type,
+                    },
+                    "output": summary,
+                })
+            return formatted_logs
+
+        # 缓存命中场景没有执行记录，补一条统一格式日志，便于前端展示。
+        if payload.get("status") == "cached":
+            return [{
+                "node": "cache_hit",
+                "timestamp": time.time(),
+                "input": query,
+                "output": "Fusion Agent 内存缓存命中",
+            }]
+
+        return []
 
     async def _stream_chunks(self, answer: str) -> AsyncGenerator[str, None]:
         buffer = ""

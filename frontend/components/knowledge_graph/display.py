@@ -3,6 +3,25 @@ from utils.api import get_knowledge_graph, get_kg_reasoning
 from .visualization import visualize_knowledge_graph
 import re
 
+
+def _resolve_focus_node_id(kg_data, evidence_id: str | None):
+    """根据选中的证据 ID 解析知识图谱中的目标节点。"""
+    if not kg_data or not evidence_id:
+        return None
+
+    nodes = kg_data.get("nodes", [])
+    node_ids = {node.get("id") for node in nodes if isinstance(node, dict)}
+    if evidence_id in node_ids:
+        return evidence_id
+
+    focus_map = kg_data.get("focus_map", {})
+    candidate_node_ids = focus_map.get(evidence_id, [])
+    for node_id in candidate_node_ids:
+        if node_id in node_ids:
+            return node_id
+
+    return None
+
 def display_knowledge_graph_tab(tabs):
     """显示知识图谱标签页内容 - 懒加载"""
     with tabs[1]:
@@ -22,6 +41,10 @@ def display_knowledge_graph_tab(tabs):
         kg_tabs = st.tabs(["图谱显示", "推理问答"])
         
         with kg_tabs[0]:
+            # 如果是从证据点击跳转而来，优先展示“回答相关图谱”。
+            if st.session_state.get("selected_evidence_id"):
+                st.session_state.kg_display_mode = "回答相关图谱"
+
             # 原有的图谱显示代码
             kg_display_mode = st.radio(
                 "显示模式:",
@@ -56,9 +79,17 @@ def display_knowledge_graph_tab(tabs):
                         # 获取相关回答的消息内容前20个字符用于显示
                         msg_preview = st.session_state.messages[msg_idx]["content"][:20] + "..."
                         st.success(f"显示与回答「{msg_preview}」相关的知识图谱")
-                        
+                        kg_data = st.session_state.messages[msg_idx]["kg_data"]
+                        focus_node_id = _resolve_focus_node_id(
+                            kg_data,
+                            st.session_state.get("selected_evidence_id"),
+                        )
+                        if focus_node_id:
+                            st.info(f"已根据证据定位图谱节点：{focus_node_id}")
+                            st.session_state.selected_focus_node_id = focus_node_id
+
                         # 显示图谱
-                        visualize_knowledge_graph(st.session_state.messages[msg_idx]["kg_data"])
+                        visualize_knowledge_graph(kg_data, focus_node_id=focus_node_id)
                     else:
                         st.info("未找到与当前回答相关的知识图谱数据")
                         # 如果没有相关图谱数据，显示提示
@@ -66,7 +97,11 @@ def display_knowledge_graph_tab(tabs):
                         with st.spinner("加载全局知识图谱..."):
                             kg_data = get_knowledge_graph(limit=100)
                             if kg_data and len(kg_data.get("nodes", [])) > 0:
-                                visualize_knowledge_graph(kg_data)
+                                focus_node_id = _resolve_focus_node_id(
+                                    kg_data,
+                                    st.session_state.get("selected_evidence_id"),
+                                )
+                                visualize_knowledge_graph(kg_data, focus_node_id=focus_node_id)
                 else:
                     st.info("在调试模式下发送查询获取相关的知识图谱")
             else:
@@ -74,7 +109,11 @@ def display_knowledge_graph_tab(tabs):
                 with st.spinner("加载全局知识图谱..."):
                     kg_data = get_knowledge_graph(limit=100)
                     if kg_data and len(kg_data.get("nodes", [])) > 0:
-                        visualize_knowledge_graph(kg_data)
+                        focus_node_id = _resolve_focus_node_id(
+                            kg_data,
+                            st.session_state.get("selected_evidence_id"),
+                        )
+                        visualize_knowledge_graph(kg_data, focus_node_id=focus_node_id)
                     else:
                         st.warning("未能加载全局知识图谱数据")
             

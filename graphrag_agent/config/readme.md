@@ -335,7 +335,7 @@ NEO4J_MAX_POOL_SIZE=20
 OPENAI_API_KEY=sk-xxx
 OPENAI_BASE_URL=http://localhost:13000/v1
 OPENAI_LLM_MODEL=gpt-4o
-OPENAI_EMBEDDINGS_MODEL=text-embedding-3-large
+OPENAI_EMBEDDINGS_MODEL=text-embedding-v4
 
 # 性能调优
 MAX_WORKERS=8
@@ -352,23 +352,41 @@ DISAMBIG_NIL_THRESHOLD=0.65
 **修改实体和关系类型**（在`settings.py`中）：
 ```python
 entity_types = [
-    "学生类型",
-    "奖学金类型",
-    "处分类型",
-    "部门",
-    "学生职责",
-    "管理规定",
+    "章节",
+    "小节",
+    "图表",
+    "案例",
+    "概念",
+    "原理定律",
+    "物理量",
+    "公式",
+    "变量",
+    "条件",
+    "过程",
+    "状态",
+    "系统对象",
+    "组成部件",
+    "材料介质",
+    "其它",
 ]
 
 relationship_types = [
-    "申请",
-    "评选",
-    "违纪",
-    "资助",
-    "申诉",
-    "管理",
-    "权利义务",
-    "互斥",
+    "包含",
+    "属于",
+    "定义",
+    "遵循",
+    "表示",
+    "使用变量",
+    "单位为",
+    "适用条件",
+    "导致",
+    "影响",
+    "依赖",
+    "具有状态",
+    "图示说明",
+    "实例说明",
+    "对比",
+    "其它",
 ]
 ```
 

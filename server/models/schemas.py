@@ -48,6 +48,18 @@ class ClearResponse(BaseModel):
     remaining_messages: Optional[str] = None
 
 
+class ClearCacheRequest(BaseModel):
+    """清除缓存请求模型"""
+    session_id: str
+    agent_type: Optional[str] = None
+
+
+class ClearCacheResponse(BaseModel):
+    """清除缓存响应模型"""
+    status: str
+    message: Optional[str] = None
+
+
 class FeedbackRequest(BaseModel):
     """反馈请求模型"""
     message_id: str

@@ -1,4 +1,5 @@
 import re
+import html
 from typing import List
 import streamlit as st
 
@@ -85,3 +86,84 @@ def process_thinking_content(content: str, show_thinking: bool = False):
     
     # 如果没有思考过程或提取失败，返回原内容
     return {"processed": content, "has_thinking": False}
+
+
+def render_answer_with_hover_citations(
+    content: str,
+) -> str:
+    """
+    为回答中的证据 ID 添加高亮徽标和悬停提示。
+
+    说明：
+        仅转换常见的证据引用格式，尽量不破坏原始 Markdown 结构。
+
+    Args:
+        content: 原始回答文本
+
+    Returns:
+        str: 带有 HTML 徽标的 Markdown 文本
+    """
+    if not isinstance(content, str) or not content:
+        return content
+
+    placeholder_map = {}
+
+    def _store_placeholder(html_fragment: str) -> str:
+        """暂存已生成的 HTML 片段，避免后续正则再次污染。"""
+        placeholder = f"__EVIDENCE_PLACEHOLDER_{len(placeholder_map)}__"
+        placeholder_map[placeholder] = html_fragment
+        return placeholder
+
+    def _build_highlight_span(keyword: str, evidence_id: str) -> str:
+        """构造仅支持悬停提示的证据关键词高亮。"""
+        escaped_id = html.escape(evidence_id, quote=True)
+        escaped_keyword = html.escape(keyword)
+
+        html_fragment = (
+            f"<span class='evidence-keyword-highlight' "
+            f"data-evidence-id='证据 ID: {escaped_id}' "
+            f"data-evidence-target='{escaped_id}'>{escaped_keyword}</span>"
+        )
+        return _store_placeholder(html_fragment)
+
+    rendered = content
+
+    # 优先处理新协议：[[ref:关键词|证据ID]]。
+    rendered = re.sub(
+        r"\[\[ref:([^|\]]+)\|([^\]]+)\]\]",
+        lambda match: _build_highlight_span(match.group(1), match.group(2)),
+        rendered,
+    )
+
+    # 优先处理“关键词[证据ID: xxx]”场景，隐藏证据ID，仅保留关键词高亮。
+    rendered = re.sub(
+        r"([A-Za-z\u4e00-\u9fff0-9_（）()《》“”‘’·\-]{1,24})\s*\[证据ID[:：]\s*([A-Za-z0-9][A-Za-z0-9_-]{5,})\]",
+        lambda match: _build_highlight_span(match.group(1), match.group(2)),
+        rendered,
+    )
+
+    # 处理“关键词[result_xxx] / 关键词[uuid-like-id]”场景。
+    rendered = re.sub(
+        r"([A-Za-z\u4e00-\u9fff0-9_（）()《》“”‘’·\-]{1,24})\s*\[([A-Za-z0-9][A-Za-z0-9_-]{7,})\]",
+        lambda match: _build_highlight_span(match.group(1), match.group(2))
+        if not match.group(2).isdigit() else match.group(0),
+        rendered,
+    )
+
+    # 如果文本里只有孤立引用标记，没有可绑定的关键词，则降级为一个轻量“引用”占位。
+    rendered = re.sub(
+        r"\[证据ID[:：]\s*([A-Za-z0-9][A-Za-z0-9_-]{5,})\]",
+        lambda match: _build_highlight_span("引用", match.group(1)),
+        rendered,
+    )
+    rendered = re.sub(
+        r"\[([A-Za-z0-9][A-Za-z0-9_-]{7,})\]",
+        lambda match: _build_highlight_span("引用", match.group(1))
+        if not match.group(1).isdigit() else match.group(0),
+        rendered,
+    )
+
+    for placeholder, html_fragment in placeholder_map.items():
+        rendered = rendered.replace(placeholder, html_fragment)
+
+    return rendered

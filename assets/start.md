@@ -83,8 +83,27 @@ textract==1.6.3  # Windows 无需安装
 # ===== LLM 模型配置 =====
 OPENAI_API_KEY = 'sk-xxx'
 OPENAI_BASE_URL = 'http://localhost:13000/v1'
-OPENAI_EMBEDDINGS_MODEL = 'text-embedding-3-large'
 OPENAI_LLM_MODEL = 'gpt-4o'
+
+# ===== Embedding 模型配置 =====
+# 若与 LLM 共用同一个兼容网关，可只填写 EMBEDDING_MODEL。
+# 若使用 Qwen Embedding 等独立服务，建议单独配置以下三项。
+EMBEDDING_API_KEY = ''
+EMBEDDING_BASE_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1'
+EMBEDDING_MODEL = 'text-embedding-v4'
+
+# 兼容旧版本配置：未设置 EMBEDDING_MODEL 时，会回退到该值
+OPENAI_EMBEDDINGS_MODEL = 'text-embedding-v4'
+
+# ===== Hugging Face 镜像与缓存配置 =====
+# 当 transformers 需要下载 tokenizer 或模型时，优先走镜像站。
+HF_ENDPOINT = 'https://hf-mirror.com'
+HF_HOME = './cache/huggingface'
+HF_HUB_CACHE = './cache/huggingface/hub'
+HF_HUB_ETAG_TIMEOUT = 30
+HF_HUB_DOWNLOAD_TIMEOUT = 60
+# 若模型与 tokenizer 已预下载到本地，可改为 1 开启离线模式。
+HF_HUB_OFFLINE = 0
 
 # ===== Neo4j 数据库配置 =====
 NEO4J_URI = 'neo4j://localhost:7687'
@@ -97,6 +116,15 @@ NEO4J_PASSWORD = '12345678'
 以下配置根据实际使用场景建议调整：
 
 ```env
+# ===== 独立 Embedding 服务示例（以 Qwen 兼容接口为例） =====
+# OPENAI_API_KEY = '你的对话模型 Key'
+# OPENAI_BASE_URL = '你的对话模型兼容地址'
+# OPENAI_LLM_MODEL = 'gpt-4o'
+#
+# EMBEDDING_API_KEY = '你的 Qwen Embedding Key'
+# EMBEDDING_BASE_URL = '你的 Qwen Embedding 兼容地址'
+# EMBEDDING_MODEL = 'text-embedding-v4'
+#
 # ===== 缓存向量模型配置 =====
 # 推荐使用第三方embedding模型api，省事。以下是需要下载的配置
 CACHE_EMBEDDING_PROVIDER = 'sentence_transformer'
@@ -288,28 +316,46 @@ pip install -e .
 
 ```python
 # 知识图谱主题
-theme = "华东理工大学学生管理"
+theme = "教材与技术文档知识体系"
 
 # 实体类型定义
 entity_types = [
-    "学生类型",
-    "奖学金类型",
-    "处分类型",
-    "部门",
-    "学生职责",
-    "管理规定",
+    "章节",
+    "小节",
+    "图表",
+    "案例",
+    "概念",
+    "原理定律",
+    "物理量",
+    "公式",
+    "变量",
+    "条件",
+    "过程",
+    "状态",
+    "系统对象",
+    "组成部件",
+    "材料介质",
+    "其它",
 ]
 
 # 关系类型定义
 relationship_types = [
-    "申请",
-    "评定",
-    "撤销",
-    "负责",
-    "担任",
-    "管理",
-    "权利义务",
-    "互斥",
+    "包含",
+    "属于",
+    "定义",
+    "遵循",
+    "表示",
+    "使用变量",
+    "单位为",
+    "适用条件",
+    "导致",
+    "影响",
+    "依赖",
+    "具有状态",
+    "图示说明",
+    "实例说明",
+    "对比",
+    "其它",
 ]
 
 # 冲突解决策略（也可通过环境变量 GRAPH_CONFLICT_STRATEGY 覆盖）

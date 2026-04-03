@@ -5,7 +5,7 @@ from pyvis.network import Network
 import streamlit.components.v1 as components
 from frontend_config.settings import KG_COLOR_PALETTE, NODE_TYPE_COLORS
 
-def visualize_knowledge_graph(kg_data):
+def visualize_knowledge_graph(kg_data, focus_node_id=None):
     """使用pyvis可视化知识图谱 - 动态节点类型和颜色，支持Neo4j式交互"""
     if not kg_data or "nodes" not in kg_data or "links" not in kg_data:
         st.warning("无法获取知识图谱数据")
@@ -240,6 +240,26 @@ def visualize_knowledge_graph(kg_data):
             # 导入交互脚本
             from .interaction import KG_INTERACTION_SCRIPT
             html_content = html_content.replace('</body>', KG_INTERACTION_SCRIPT + '</body>')
+
+            # 如果指定了目标节点，则在图谱稳定后自动聚焦到该节点。
+            if focus_node_id:
+                escaped_node_id = str(focus_node_id).replace("\\", "\\\\").replace("'", "\\'")
+                focus_script = f"""
+                <script>
+                    document.addEventListener('DOMContentLoaded', function() {{
+                        setTimeout(function() {{
+                            try {{
+                                if (typeof focusOnNode === 'function' && network && network.body && network.body.data.nodes.get('{escaped_node_id}')) {{
+                                    focusOnNode('{escaped_node_id}');
+                                }}
+                            }} catch (e) {{
+                                console.error('自动聚焦图谱节点失败:', e);
+                            }}
+                        }}, 450);
+                    }});
+                </script>
+                """
+                html_content = html_content.replace('</body>', focus_script + '</body>')
             
             components.html(html_content, height=600)
         

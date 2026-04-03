@@ -1,6 +1,6 @@
 import re
 import traceback
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Tuple
 from server_config.database import get_db_manager
 from utils.keywords import extract_smart_keywords
 
@@ -8,6 +8,269 @@ from utils.keywords import extract_smart_keywords
 # 获取数据库连接
 db_manager = get_db_manager()
 driver = db_manager.driver
+
+
+def _deduplicate_ids(values: List[Any]) -> List[Any]:
+    """按顺序去重，避免重复查询。"""
+    seen = set()
+    deduplicated = []
+    for value in values:
+        key = str(value)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduplicated.append(value)
+    return deduplicated
+
+
+def _parse_numeric_or_string(value: str) -> Any:
+    """将 ID 尽量转换为数字，否则保留字符串。"""
+    clean_value = value.strip().strip("'\"")
+    if clean_value.lstrip("-").isdigit():
+        try:
+            return int(clean_value)
+        except ValueError:
+            return clean_value
+    return clean_value
+
+
+def _parse_reference_ids_from_message(message: str) -> Tuple[List[Any], List[Any], List[str], List[Any]]:
+    """
+    从回答文本中解析实体、关系、文本块和报告引用。
+
+    支持格式：
+    1. `### 引用数据` 中的 `{'data': {...}}`
+    2. `[[ref:关键词|Entities:4]]`
+    3. `data-evidence-target="Chunks:xxxx"` 等 HTML 渲染残留
+    """
+    entity_ids: List[Any] = []
+    relationship_ids: List[Any] = []
+    chunk_ids: List[str] = []
+    report_ids: List[Any] = []
+
+    def _append_by_prefix(raw_id: str):
+        """按前缀将引用分发到不同容器。"""
+        clean_id = raw_id.strip().strip("'\"")
+        if not clean_id:
+            return
+
+        prefix_match = re.match(r"^(Entities|Relationships|Reports|Chunks)\s*:\s*(.+)$", clean_id)
+        if prefix_match:
+            prefix = prefix_match.group(1)
+            suffix = prefix_match.group(2).strip()
+            if prefix == "Entities":
+                entity_ids.append(_parse_numeric_or_string(suffix))
+            elif prefix == "Relationships":
+                relationship_ids.append(_parse_numeric_or_string(suffix))
+            elif prefix == "Reports":
+                report_ids.append(_parse_numeric_or_string(suffix))
+            elif prefix == "Chunks":
+                chunk_ids.append(suffix)
+            return
+
+        # 兼容纯 chunk hash 和其他直接实体 ID。
+        if re.fullmatch(r"[a-fA-F0-9]{40}", clean_id):
+            chunk_ids.append(clean_id)
+        else:
+            entity_ids.append(_parse_numeric_or_string(clean_id))
+
+    # 解析引用数据块中的列表结构。
+    for key, target_list in (
+        ("Entities", entity_ids),
+        ("Relationships", relationship_ids),
+        ("Reports", report_ids),
+    ):
+        pattern = rf"['\"]?{key}['\"]?\s*:\s*\[(.*?)\]"
+        match = re.search(pattern, message, re.DOTALL)
+        if match:
+            parts = [part.strip() for part in match.group(1).split(",") if part.strip()]
+            for part in parts:
+                target_list.append(_parse_numeric_or_string(part))
+
+    chunk_match = re.search(r"['\"]?Chunks['\"]?\s*:\s*\[(.*?)\]", message, re.DOTALL)
+    if chunk_match:
+        chunks_str = chunk_match.group(1).strip()
+        if "'" in chunks_str or '"' in chunks_str:
+            chunk_ids.extend(re.findall(r"['\"]([^'\"]+)['\"]", chunks_str))
+        else:
+            chunk_ids.extend([part.strip() for part in chunks_str.split(",") if part.strip()])
+
+    # 解析新的引用协议 [[ref:关键词|...]]。
+    for _, raw_id in re.findall(r"\[\[ref:([^|\]]+)\|([^\]]+)\]\]", message):
+        _append_by_prefix(raw_id)
+
+    # 解析前端渲染后的 HTML 属性残留。
+    for raw_id in re.findall(r"data-evidence-target=['\"]([^'\"]+)['\"]", message):
+        _append_by_prefix(raw_id)
+
+    return (
+        _deduplicate_ids(entity_ids),
+        _deduplicate_ids(relationship_ids),
+        _deduplicate_ids(chunk_ids),
+        _deduplicate_ids(report_ids),
+    )
+
+
+def _merge_graph_parts(*graph_parts: Dict[str, Any]) -> Dict[str, Any]:
+    """合并多个子图，保留唯一节点和关系。"""
+    nodes = []
+    links = []
+    focus_map: Dict[str, List[str]] = {}
+    node_ids = set()
+    link_keys = set()
+
+    for graph_part in graph_parts:
+        if not graph_part:
+            continue
+
+        for node in graph_part.get("nodes", []):
+            node_id = node.get("id") if isinstance(node, dict) else None
+            if not node_id or node_id in node_ids:
+                continue
+            node_ids.add(node_id)
+            nodes.append(node)
+
+        for link in graph_part.get("links", []):
+            if not isinstance(link, dict):
+                continue
+            link_key = (
+                str(link.get("source")),
+                str(link.get("target")),
+                str(link.get("label")),
+            )
+            if link_key in link_keys:
+                continue
+            link_keys.add(link_key)
+            links.append(link)
+
+        for evidence_id, related_nodes in graph_part.get("focus_map", {}).items():
+            focus_map.setdefault(evidence_id, [])
+            for node_id in related_nodes:
+                if node_id not in focus_map[evidence_id]:
+                    focus_map[evidence_id].append(node_id)
+
+    return {
+        "nodes": nodes,
+        "links": links,
+        "focus_map": focus_map,
+    }
+
+
+def _fetch_exact_entity_subgraph(entity_ids: List[Any]) -> Dict[str, Any]:
+    """
+    从全局图中提取严格子图：
+    仅保留指定实体节点，以及这些节点之间真实存在的边。
+    """
+    try:
+        verified_entity_ids = check_entity_existence(_deduplicate_ids(entity_ids))
+        if not verified_entity_ids:
+            return {"nodes": [], "links": [], "focus_map": {}}
+
+        query = """
+        // 第一步：只收集回答中实际命中的实体节点。
+        MATCH (e:__Entity__)
+        WHERE e.id IN $entity_ids
+        WITH collect(DISTINCT e) AS entities
+
+        // 第二步：枚举实体对，并在独立的 WITH 中完成关系聚合，
+        // 避免 Neo4j 出现“聚合函数嵌套”语法错误。
+        UNWIND entities AS e1
+        UNWIND entities AS e2
+        WITH entities, e1, e2
+        WHERE e1.id < e2.id
+        OPTIONAL MATCH (e1)-[r]-(e2)
+        WITH entities, e1, e2, collect(r) AS rels
+
+        // 第三步：将每对实体之间的多条边展开为扁平 links 列表。
+        WITH entities,
+             collect({
+                 source: e1.id,
+                 target: e2.id,
+                 rels: rels
+             }) AS relation_groups
+        WITH entities,
+             [group IN relation_groups WHERE size(group.rels) > 0 |
+                [rel IN group.rels | {
+                    source: group.source,
+                    target: group.target,
+                    label: type(rel),
+                    weight: CASE WHEN rel.weight IS NULL THEN 1 ELSE rel.weight END
+                }]
+             ] AS links_nested
+        WITH entities,
+             REDUCE(acc = [], current IN links_nested | acc + current) AS all_links
+
+        RETURN
+        [entity IN entities | {
+            id: entity.id,
+            label: entity.id,
+            description: CASE WHEN entity.description IS NULL THEN '' ELSE entity.description END,
+            group: CASE
+                WHEN [lbl IN labels(entity) WHERE lbl <> '__Entity__'] <> []
+                THEN [lbl IN labels(entity) WHERE lbl <> '__Entity__'][0]
+                ELSE 'AnswerEntity'
+            END
+        }] AS nodes,
+        all_links AS links
+        """
+
+        result = driver.execute_query(query, {"entity_ids": verified_entity_ids})
+        if not result.records:
+            return {"nodes": [], "links": [], "focus_map": {}}
+
+        record = result.records[0]
+        nodes = record.get("nodes", []) or []
+        links = record.get("links", []) or []
+        focus_map = {str(entity_id): [entity_id] for entity_id in verified_entity_ids}
+        return {"nodes": nodes, "links": links, "focus_map": focus_map}
+    except Exception as e:
+        print(f"提取严格实体子图失败: {str(e)}")
+        return {"nodes": [], "links": [], "focus_map": {}}
+
+
+def _resolve_answer_entity_ids(
+    entity_ids: List[Any],
+    relationship_ids: List[Any],
+    chunk_ids: List[str],
+    report_ids: List[Any],
+) -> Tuple[List[Any], Dict[str, List[str]]]:
+    """
+    将回答中的各类引用统一解析成“回答实际使用的实体节点集合”。
+
+    说明：
+        - `Entities:*` 直接视为已使用节点
+        - `Relationships:*` 转为其两端实体
+        - `Chunks:*` 转为该文本块提到的实体
+        - `Reports:*` 暂不扩散为整社区所有实体，避免子图失真
+    """
+    resolved_entity_ids: List[Any] = list(entity_ids or [])
+    focus_map: Dict[str, List[str]] = {}
+
+    # 关系引用 -> 两端实体
+    if relationship_ids:
+        relationship_graph = get_graph_from_relationships(relationship_ids)
+        for rel_id, related_nodes in relationship_graph.get("focus_map", {}).items():
+            if related_nodes:
+                focus_map[rel_id] = related_nodes
+                resolved_entity_ids.extend(related_nodes)
+
+    # 文本块引用 -> 文本块提及的实体
+    for chunk_id in chunk_ids or []:
+        chunk_entities = get_entities_from_chunk(chunk_id)
+        if chunk_entities:
+            focus_map[chunk_id] = chunk_entities
+            resolved_entity_ids.extend(chunk_entities)
+
+    # 直接实体引用
+    for entity_id in entity_ids or []:
+        focus_map[str(entity_id)] = [entity_id]
+
+    # Reports 目前不直接扩张为整个社区，避免把回答相关图谱放大成社区图。
+    # 保留该引用键，前端若后续需要可据此提示“该引用无法精确映射到实体节点”。
+    for report_id in report_ids or []:
+        focus_map.setdefault(str(report_id), [])
+
+    return _deduplicate_ids(resolved_entity_ids), focus_map
 
 
 def extract_kg_from_message(message: str, query: str = None, reference: Dict = None) -> Dict:
@@ -52,67 +315,33 @@ def extract_kg_from_message(message: str, query: str = None, reference: Dict = N
             think_pattern = r'<think>.*?</think>'
             message = re.sub(think_pattern, '', message, flags=re.DOTALL).strip()
         
-        # 直接使用正则表达式提取各部分数据
-        entity_ids = []
-        rel_ids = []
-        chunk_ids = []
-        
-        # 匹配 Entities 列表
-        entity_pattern = r"['\"]?Entities['\"]?\s*:\s*\[(.*?)\]"
-        entity_match = re.search(entity_pattern, message, re.DOTALL)
-        if entity_match:
-            entity_str = entity_match.group(1).strip()
-            try:
-                # 处理数字ID
-                entity_parts = [p.strip() for p in entity_str.split(',') if p.strip()]
-                for part in entity_parts:
-                    clean_part = part.strip("'\"")
-                    if clean_part.isdigit():
-                        entity_ids.append(int(clean_part))
-                    else:
-                        entity_ids.append(clean_part)
-            except Exception as e:
-                print(f"解析实体ID时出错: {e}")
-        
-        # 匹配 Relationships 或 Reports 列表
-        rel_pattern = r"['\"]?(?:Relationships|Reports)['\"]?\s*:\s*\[(.*?)\]"
-        rel_match = re.search(rel_pattern, message, re.DOTALL)
-        if rel_match:
-            rel_str = rel_match.group(1).strip()
-            try:
-                # 处理数字ID
-                rel_parts = [p.strip() for p in rel_str.split(',') if p.strip()]
-                for part in rel_parts:
-                    clean_part = part.strip("'\"")
-                    if clean_part.isdigit():
-                        rel_ids.append(int(clean_part))
-                    else:
-                        rel_ids.append(clean_part)
-            except Exception as e:
-                print(f"解析关系ID时出错: {e}")
-        
-        # 匹配 Chunks 列表
-        chunk_pattern = r"['\"]?Chunks['\"]?\s*:\s*\[(.*?)\]"
-        chunk_match = re.search(chunk_pattern, message, re.DOTALL)
-        if chunk_match:
-            chunks_str = chunk_match.group(1).strip()
-            
-            # 处理带引号的chunk IDs
-            if "'" in chunks_str or '"' in chunks_str:
-                # 匹配所有被引号包围的内容
-                chunk_parts = re.findall(r"['\"]([^'\"]*)['\"]", chunks_str)
-                chunk_ids = [part for part in chunk_parts if part]
-            else:
-                # 没有引号的情况，直接分割
-                chunk_ids = [part.strip() for part in chunks_str.split(',') if part.strip()]
+        # 统一解析回答中的引用结构，兼容旧 `引用数据` 和新 `[[ref:...|...]]`。
+        entity_ids, rel_ids, chunk_ids, report_ids = _parse_reference_ids_from_message(message)
         
         # 提取关键词 (可选)
         query_keywords = []
         if query:
             query_keywords = extract_smart_keywords(query)
         
-        # 获取知识图谱
-        return get_knowledge_graph_for_ids(entity_ids, rel_ids, chunk_ids)
+        # 构造“回答相关图谱”：
+        # 在全局图中仅保留回答实际使用的节点，以及这些节点之间已有的边。
+        answer_entity_ids, answer_focus_map = _resolve_answer_entity_ids(
+            entity_ids=entity_ids,
+            relationship_ids=rel_ids,
+            chunk_ids=chunk_ids,
+            report_ids=report_ids,
+        )
+        subgraph = _fetch_exact_entity_subgraph(answer_entity_ids)
+
+        # 合并证据到节点的映射，供前端聚焦使用。
+        for evidence_id, node_ids in answer_focus_map.items():
+            subgraph.setdefault("focus_map", {})
+            subgraph["focus_map"].setdefault(evidence_id, [])
+            for node_id in node_ids:
+                if node_id not in subgraph["focus_map"][evidence_id]:
+                    subgraph["focus_map"][evidence_id].append(node_id)
+
+        return subgraph
         
     except Exception as e:
         print(f"提取知识图谱数据失败: {str(e)}")
@@ -319,10 +548,19 @@ def get_graph_from_chunks(chunk_ids: List[str]) -> Dict:
         nodes = record.get("nodes", [])
         links = record.get("links", [])
         print(f"从文本块查询结果: {len(nodes)} 个节点, {len(links)} 个连接")
+
+        node_ids = {node.get("id") for node in nodes if isinstance(node, dict)}
+        focus_map = {}
+        for chunk_id in chunk_ids:
+            chunk_entities = get_entities_from_chunk(chunk_id)
+            matched_entities = [entity_id for entity_id in chunk_entities if entity_id in node_ids]
+            if matched_entities:
+                focus_map[chunk_id] = matched_entities
         
         return {
             "nodes": nodes,
-            "links": links
+            "links": links,
+            "focus_map": focus_map,
         }
         
     except Exception as e:
@@ -330,7 +568,155 @@ def get_graph_from_chunks(chunk_ids: List[str]) -> Dict:
         return {"nodes": [], "links": []}
 
 
-def get_knowledge_graph_for_ids(entity_ids=None, relationship_ids=None, chunk_ids=None) -> Dict:
+def get_graph_from_relationships(relationship_ids: List[Any]) -> Dict:
+    """
+    根据关系 ID 获取相关实体和边。
+
+    说明：
+        这里的关系 ID 来自回答中的 Relationships 引用，优先尝试匹配 `r.id`，
+        兼容部分图中关系 ID 存为数值或字符串的情况。
+    """
+    try:
+        if not relationship_ids:
+            return {"nodes": [], "links": [], "focus_map": {}}
+
+        normalized_ids = [_parse_numeric_or_string(str(rel_id)) for rel_id in relationship_ids]
+        query = """
+        UNWIND $relationship_ids AS rel_id
+        MATCH (source:__Entity__)-[r]-(target:__Entity__)
+        WHERE r.id = rel_id
+           OR toString(r.id) = toString(rel_id)
+           OR toString(id(r)) = toString(rel_id)
+        RETURN DISTINCT
+            rel_id AS rel_id,
+            source.id AS source_id,
+            target.id AS target_id,
+            type(r) AS relation_type,
+            CASE WHEN r.weight IS NULL THEN 1 ELSE r.weight END AS weight,
+            source.description AS source_description,
+            target.description AS target_description
+        """
+        result = driver.execute_query(query, {"relationship_ids": normalized_ids})
+
+        if not result.records:
+            return {"nodes": [], "links": [], "focus_map": {}}
+
+        nodes = []
+        links = []
+        node_map = {}
+        focus_map: Dict[str, List[str]] = {}
+
+        for record in result.records:
+            source_id = record.get("source_id")
+            target_id = record.get("target_id")
+            relation_type = record.get("relation_type")
+            rel_id = str(record.get("rel_id"))
+
+            if source_id and source_id not in node_map:
+                node_data = {
+                    "id": source_id,
+                    "label": source_id,
+                    "description": record.get("source_description", "") or "",
+                    "group": "RelationshipSource",
+                }
+                node_map[source_id] = node_data
+                nodes.append(node_data)
+
+            if target_id and target_id not in node_map:
+                node_data = {
+                    "id": target_id,
+                    "label": target_id,
+                    "description": record.get("target_description", "") or "",
+                    "group": "RelationshipTarget",
+                }
+                node_map[target_id] = node_data
+                nodes.append(node_data)
+
+            if source_id and target_id and relation_type:
+                links.append({
+                    "source": source_id,
+                    "target": target_id,
+                    "label": relation_type,
+                    "weight": record.get("weight", 1),
+                })
+
+            focus_map[rel_id] = [node_id for node_id in [source_id, target_id] if node_id]
+
+        return {"nodes": nodes, "links": links, "focus_map": focus_map}
+    except Exception as e:
+        print(f"根据关系ID获取图谱失败: {str(e)}")
+        return {"nodes": [], "links": [], "focus_map": {}}
+
+
+def get_graph_from_reports(report_ids: List[Any]) -> Dict:
+    """
+    根据报告/社区引用获取相关图谱。
+
+    说明：
+        Reports 在现有问答中通常代表社区级摘要引用，这里尝试按社区节点 ID、
+        字符串形式或 community_rank 进行匹配，并展开到所属实体。
+    """
+    try:
+        if not report_ids:
+            return {"nodes": [], "links": [], "focus_map": {}}
+
+        normalized_ids = [_parse_numeric_or_string(str(report_id)) for report_id in report_ids]
+        query = """
+        UNWIND $report_ids AS report_id
+        MATCH (c:__Community__)
+        WHERE c.id = report_id
+           OR toString(c.id) = toString(report_id)
+           OR toString(c.community_rank) = toString(report_id)
+        OPTIONAL MATCH (entity:__Entity__)-[:IN_COMMUNITY]->(c)
+        RETURN report_id,
+               c.id AS community_id,
+               c.summary AS community_summary,
+               collect(DISTINCT entity.id) AS entity_ids,
+               collect(DISTINCT entity.description) AS entity_descriptions
+        """
+        result = driver.execute_query(query, {"report_ids": normalized_ids})
+
+        if not result.records:
+            return {"nodes": [], "links": [], "focus_map": {}}
+
+        community_nodes = []
+        community_links = []
+        focus_map: Dict[str, List[str]] = {}
+        entity_ids: List[Any] = []
+
+        for record in result.records:
+            community_id = record.get("community_id")
+            report_id = str(record.get("report_id"))
+            member_entities = [entity_id for entity_id in record.get("entity_ids", []) if entity_id]
+
+            if community_id:
+                community_nodes.append({
+                    "id": f"Community:{community_id}",
+                    "label": f"Community:{community_id}",
+                    "description": record.get("community_summary", "") or "",
+                    "group": "Report",
+                })
+                for entity_id in member_entities:
+                    community_links.append({
+                        "source": f"Community:{community_id}",
+                        "target": entity_id,
+                        "label": "IN_COMMUNITY",
+                        "weight": 1,
+                    })
+                focus_map[report_id] = [f"Community:{community_id}"] + member_entities
+                entity_ids.extend(member_entities)
+
+        entity_graph = get_knowledge_graph_for_ids(entity_ids=_deduplicate_ids(entity_ids))
+        return _merge_graph_parts(
+            {"nodes": community_nodes, "links": community_links, "focus_map": focus_map},
+            entity_graph,
+        )
+    except Exception as e:
+        print(f"根据报告ID获取图谱失败: {str(e)}")
+        return {"nodes": [], "links": [], "focus_map": {}}
+
+
+def get_knowledge_graph_for_ids(entity_ids=None, relationship_ids=None, chunk_ids=None, report_ids=None) -> Dict:
     """
     根据ID获取知识图谱数据
     
@@ -338,6 +724,7 @@ def get_knowledge_graph_for_ids(entity_ids=None, relationship_ids=None, chunk_id
         entity_ids: 实体ID列表(可选)
         relationship_ids: 关系ID列表(可选)
         chunk_ids: 文本块ID列表(可选)
+        report_ids: 报告/社区引用ID列表(可选)
     
     Returns:
         Dict: 知识图谱数据，包含节点和连接
@@ -347,6 +734,7 @@ def get_knowledge_graph_for_ids(entity_ids=None, relationship_ids=None, chunk_id
         entity_ids = entity_ids or []
         relationship_ids = relationship_ids or []
         chunk_ids = chunk_ids or []
+        report_ids = report_ids or []
         
         # 如果提供了文本块ID，但没有实体ID，尝试从文本块获取实体
         if chunk_ids and not entity_ids:
@@ -357,16 +745,38 @@ def get_knowledge_graph_for_ids(entity_ids=None, relationship_ids=None, chunk_id
             # 去重
             entity_ids = list(set(entity_ids))
         
-        if not entity_ids and not chunk_ids:
+        if not entity_ids and not chunk_ids and not relationship_ids and not report_ids:
             return {"nodes": [], "links": []}
-        
+
+        graph_parts = []
+
+        # 先展开关系引用和报告引用，补充实体上下文。
+        if relationship_ids:
+            relationship_graph = get_graph_from_relationships(relationship_ids)
+            graph_parts.append(relationship_graph)
+
+            # 将关系端点并入实体ID，便于后续一跳扩展。
+            for node_ids in relationship_graph.get("focus_map", {}).values():
+                entity_ids.extend(node_ids)
+
+        if report_ids:
+            report_graph = get_graph_from_reports(report_ids)
+            graph_parts.append(report_graph)
+
+            for node_ids in report_graph.get("focus_map", {}).values():
+                for node_id in node_ids:
+                    if isinstance(node_id, str) and node_id.startswith("Community:"):
+                        continue
+                    entity_ids.append(node_id)
+
         # 检查实体ID是否存在
-        verified_entity_ids = check_entity_existence(entity_ids)
+        verified_entity_ids = check_entity_existence(_deduplicate_ids(entity_ids))
         if not verified_entity_ids:
             # 尝试直接使用文本块查询
             if chunk_ids:
-                return get_graph_from_chunks(chunk_ids)
-            return {"nodes": [], "links": []}
+                graph_parts.append(get_graph_from_chunks(chunk_ids))
+                return _merge_graph_parts(*graph_parts)
+            return _merge_graph_parts(*graph_parts)
         
         # 使用确认存在的实体ID进行查询
         params = {
@@ -487,19 +897,39 @@ def get_knowledge_graph_for_ids(entity_ids=None, relationship_ids=None, chunk_id
         record = result.records[0]
         nodes = record.get("nodes", [])
         links = record.get("links", [])
+        node_ids = {node.get("id") for node in nodes if isinstance(node, dict)}
+        focus_map = {}
+
+        # 为证据定位保留证据到实体节点的映射，前端可据此自动聚焦。
+        for entity_id in verified_entity_ids:
+            if entity_id in node_ids:
+                focus_map[str(entity_id)] = [entity_id]
+
+        for chunk_id in chunk_ids:
+            chunk_entities = get_entities_from_chunk(chunk_id)
+            matched_entities = [entity_id for entity_id in chunk_entities if entity_id in node_ids]
+            if matched_entities:
+                focus_map[chunk_id] = matched_entities
         
-        return {
+        graph_parts.append({
             "nodes": nodes,
-            "links": links
-        }
+            "links": links,
+            "focus_map": focus_map,
+        })
+
+        if chunk_ids:
+            graph_parts.append(get_graph_from_chunks(chunk_ids))
+
+        return _merge_graph_parts(*graph_parts)
         
     except Exception as e:
         print(f"获取知识图谱失败: {str(e)}")
         
         # 尝试直接使用文本块查询
         if chunk_ids:
-            return get_graph_from_chunks(chunk_ids)
-        return {"nodes": [], "links": []}
+            graph_parts.append(get_graph_from_chunks(chunk_ids))
+            return _merge_graph_parts(*graph_parts)
+        return _merge_graph_parts(*graph_parts)
 
 
 def get_knowledge_graph(limit: int = 100, query: str = None) -> Dict:

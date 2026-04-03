@@ -66,12 +66,18 @@ class BaseAgent(ABC):
         )
         
         self.performance_metrics = {}  # 性能指标收集
+        # 关键词缓存与回答缓存隔离，避免结构化字典误入回答缓存链路。
+        self._keyword_cache: Dict[str, Dict[str, List[str]]] = {}
         
         # 初始化工具
         self.tools = self._setup_tools()
         
         # 设置工作流图
         self._setup_graph()
+
+    def _is_valid_text_response(self, value: Any) -> bool:
+        """判断对象是否为可直接作为最终回答的文本。"""
+        return isinstance(value, str) and bool(value.strip())
     
     @abstractmethod
     def _setup_tools(self) -> List:
@@ -287,7 +293,7 @@ class BaseAgent(ABC):
             "hit": result is not None
         })
         
-        return result
+        return result if self._is_valid_text_response(result) else None
     
     def _check_all_caches(self, query: str, thread_id: str = "default"):
         """整合的缓存检查方法"""
@@ -295,7 +301,7 @@ class BaseAgent(ABC):
         
         # 1. 首先尝试全局缓存（跨会话缓存）
         global_result = self.global_cache_manager.get(query)
-        if global_result:
+        if self._is_valid_text_response(global_result):
             print(f"全局缓存命中: {query[:30]}...")
             
             cache_time = time.time() - cache_check_start
@@ -308,7 +314,7 @@ class BaseAgent(ABC):
         
         # 2. 尝试快速路径 - 跳过验证的高质量缓存
         fast_result = self.check_fast_cache(query, thread_id)
-        if fast_result:
+        if self._is_valid_text_response(fast_result):
             print(f"快速路径缓存命中: {query[:30]}...")
             
             # 将命中的内容同步到全局缓存
@@ -324,7 +330,7 @@ class BaseAgent(ABC):
         
         # 3. 尝试常规缓存路径，但优化验证
         cached_response = self.cache_manager.get(query, skip_validation=True, thread_id=thread_id)
-        if cached_response:
+        if self._is_valid_text_response(cached_response):
             print(f"常规缓存命中，跳过验证: {query[:30]}...")
             
             # 将命中的内容同步到全局缓存
@@ -365,7 +371,7 @@ class BaseAgent(ABC):
         global_result = self.global_cache_manager.get(safe_query)
         global_cache_time = time.time() - global_cache_start
         
-        if global_result:
+        if self._is_valid_text_response(global_result):
             print(f"全局缓存命中: {safe_query[:30]}... ({global_cache_time:.4f}s)")
             
             return {
@@ -378,7 +384,7 @@ class BaseAgent(ABC):
         fast_result = self.check_fast_cache(safe_query, thread_id)
         fast_cache_time = time.time() - fast_cache_start
         
-        if fast_result:
+        if self._is_valid_text_response(fast_result):
             print(f"快速路径缓存命中: {safe_query[:30]}... ({fast_cache_time:.4f}s)")
             
             # 将命中的内容同步到全局缓存
@@ -394,7 +400,7 @@ class BaseAgent(ABC):
         cached_response = self.cache_manager.get(safe_query, thread_id=thread_id)
         cache_time = time.time() - cache_start
         
-        if cached_response:
+        if self._is_valid_text_response(cached_response):
             print(f"完整问答缓存命中: {safe_query[:30]}... ({cache_time:.4f}s)")
             
             # 将命中的内容同步到全局缓存
@@ -428,7 +434,7 @@ class BaseAgent(ABC):
             answer = chat_history[-1].content
             
             # 缓存处理结果 - 同时更新会话缓存和全局缓存
-            if answer and len(answer) > 10:
+            if self._is_valid_text_response(answer) and len(answer) > 10:
                 # 更新会话缓存
                 self.cache_manager.set(safe_query, answer, thread_id=thread_id)
                 # 更新全局缓存
@@ -493,7 +499,7 @@ class BaseAgent(ABC):
             answer = chat_history[-1].content
             
             # 缓存处理结果 - 同时更新会话缓存和全局缓存
-            if answer and len(answer) > 10:
+            if self._is_valid_text_response(answer) and len(answer) > 10:
                 # 更新会话缓存
                 self.cache_manager.set(safe_query, answer, thread_id=thread_id)
                 # 更新全局缓存

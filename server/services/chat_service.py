@@ -149,10 +149,11 @@ async def process_chat(message: str, session_id: str, debug: bool = False, agent
                 
                 # 从结果中提取知识图谱数据
                 kg_data = extract_kg_from_message(result["answer"])
+                execution_log = result.get("execution_log", [])
                 
                 return {
                     "answer": result["answer"],
-                    "execution_log": result["execution_log"],
+                    "execution_log": execution_log,
                     "kg_data": kg_data,
                 }
         else:

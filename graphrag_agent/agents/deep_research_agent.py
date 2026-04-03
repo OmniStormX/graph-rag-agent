@@ -138,7 +138,7 @@ class DeepResearchAgent(BaseAgent):
 
         # 首先尝试全局缓存
         global_result = self.global_cache_manager.get(question)
-        if global_result:
+        if self._is_valid_text_response(global_result):
             self._log_execution("generate", 
                             {"question": question, "source": "全局缓存"}, 
                             "全局缓存命中")
@@ -149,7 +149,7 @@ class DeepResearchAgent(BaseAgent):
             
         # 然后检查会话缓存
         cached_result = self.cache_manager.get(question, thread_id=thread_id)
-        if cached_result:
+        if self._is_valid_text_response(cached_result):
             self._log_execution("generate", 
                             {"question": question, "source": "会话缓存"}, 
                             "会话缓存命中")
