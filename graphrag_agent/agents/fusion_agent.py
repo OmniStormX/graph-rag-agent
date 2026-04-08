@@ -1,7 +1,9 @@
 import asyncio
+import queue
 import re
+import threading
 import time
-from typing import Any, AsyncGenerator, Dict, Optional, Tuple
+from typing import Any, AsyncGenerator, Callable, Dict, Optional, Tuple
 
 from graphrag_agent.config.settings import AGENT_SETTINGS
 from graphrag_agent.runtime_logging import emit_runtime_log, shorten_text
@@ -85,18 +87,78 @@ class FusionGraphRAGAgent:
         )
         return result
 
-    async def ask_stream(self, query: str, thread_id: str = "default", recursion_limit: Optional[int] = None) -> AsyncGenerator[str, None]:
+    async def ask_stream(self, query: str, thread_id: str = "default", recursion_limit: Optional[int] = None) -> AsyncGenerator[Any, None]:
         cached = self._read_cache(query, thread_id)
         if cached is None:
-            cached, _ = await asyncio.to_thread(self._execute, query, thread_id)
+            progress_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
+            result_holder: Dict[str, Any] = {}
+            sentinel = "__fusion_stream_done__"
+
+            def emit_progress(event: Dict[str, Any]) -> None:
+                """将编排事件安全地投递到流式队列。"""
+                progress_queue.put(dict(event))
+
+            def run_execute() -> None:
+                """在线程中执行完整编排，避免阻塞异步流。"""
+                try:
+                    answer, payload = self._execute(
+                        query,
+                        thread_id,
+                        progress_callback=emit_progress,
+                    )
+                    result_holder["answer"] = answer
+                    result_holder["payload"] = payload
+                except Exception as exc:  # noqa: BLE001
+                    result_holder["error"] = str(exc)
+                finally:
+                    progress_queue.put({"status": sentinel})
+
+            worker = threading.Thread(target=run_execute, daemon=True)
+            worker.start()
+
+            while True:
+                try:
+                    event = await asyncio.to_thread(progress_queue.get, True, 0.1)
+                except queue.Empty:
+                    if worker.is_alive():
+                        continue
+                    break
+
+                if event.get("status") == sentinel:
+                    break
+                yield event
+
+            await asyncio.to_thread(worker.join)
+            if result_holder.get("error"):
+                yield {
+                    "status": "error",
+                    "message": result_holder["error"],
+                }
+                return
+            cached = result_holder.get("answer", FUSION_EMPTY_ANSWER)
+        else:
+            yield {
+                "status": "stage",
+                "stage": "cache_replay",
+                "content": "命中缓存，正在回放结果",
+            }
+
         async for chunk in self._stream_chunks(cached):
-            yield chunk
+            yield {"status": "token", "content": chunk}
 
     def close(self) -> None:
         self._global_cache.clear()
         self._session_cache.clear()
 
-    def _execute(self, query: str, thread_id: str, *, assumptions: Optional[list[str]] = None, report_type: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
+    def _execute(
+        self,
+        query: str,
+        thread_id: str,
+        *,
+        assumptions: Optional[list[str]] = None,
+        report_type: Optional[str] = None,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> Tuple[str, Dict[str, Any]]:
         self._log_runtime_event(
             "fusion.execute.start",
             thread_id=thread_id,
@@ -110,7 +172,12 @@ class FusionGraphRAGAgent:
             )
             return cached, {"status": "cached", "execution_records": []}
         start_time = time.time()
-        payload = self.multi_agent.process_query(query.strip(), assumptions=assumptions, report_type=report_type)
+        payload = self.multi_agent.process_query(
+            query.strip(),
+            assumptions=assumptions,
+            report_type=report_type,
+            progress_callback=progress_callback,
+        )
         answer = self._normalize_answer(payload.get("response"))
         # 失败兜底答案不进入缓存，避免快速路径持续放大同一错误。
         if answer != FUSION_EMPTY_ANSWER:

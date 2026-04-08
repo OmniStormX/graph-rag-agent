@@ -6,6 +6,7 @@ Planner编排基类
 from typing import Optional, List, Set
 from datetime import datetime
 import logging
+import re
 import uuid
 
 from pydantic import BaseModel, Field
@@ -172,6 +173,7 @@ class BasePlanner:
         )
 
         plan_spec = review_outcome.plan_spec
+        self._mark_lightweight_preferences(context.original_query, plan_spec)
         self._ensure_reflection_task(plan_spec)
         # 将生成的计划写回状态
         state.plan = plan_spec
@@ -224,6 +226,113 @@ class BasePlanner:
         except ValueError as exc:  # noqa: BLE001
             task_graph.nodes.pop()
             _LOGGER.warning("反思节点插入失败，保持原计划: %s", exc)
+
+    def _mark_lightweight_preferences(
+        self,
+        query: str,
+        plan_spec: Optional[PlanSpec],
+    ) -> None:
+        """
+        为简单解释型问题标记轻量执行偏好，但不改写任务类型。
+
+        说明：
+            Planner/Reviewer 已经完成“做什么任务”的决策，这里不应直接将
+            ``deep_research`` 改写为 ``global_search``。否则会绕过研究执行器，
+            导致原本需要深度研究的问题退化成浅层检索。
+
+            因此这里只写入轻量化提示，供后续执行层或工具层按需消费。
+        """
+        if plan_spec is None or plan_spec.task_graph is None:
+            return
+        if not self._should_constrain_deep_research(query, plan_spec):
+            return
+
+        for node in plan_spec.task_graph.nodes:
+            if node.task_type not in {"deep_research", "deeper_research", "chain_exploration"}:
+                continue
+
+            # 仅记录轻量偏好，避免覆盖 Planner 对任务语义的判断。
+            node.parameters["lightweight_preference"] = True
+            node.parameters["lightweight_reason"] = "simple_explainer_query"
+
+            # 仅温和压低预算，保留原始任务类型和执行器路由。
+            if node.task_type in {"deep_research", "deeper_research"}:
+                node.estimated_tokens = min(node.estimated_tokens, 600)
+            elif node.task_type == "chain_exploration":
+                node.estimated_tokens = min(node.estimated_tokens, 400)
+
+            _LOGGER.info(
+                "为任务标记轻量执行偏好: task_id=%s task_type=%s",
+                node.task_id,
+                node.task_type,
+            )
+
+    def _should_constrain_deep_research(
+        self,
+        query: str,
+        plan_spec: PlanSpec,
+    ) -> bool:
+        """
+        判断是否应当压低 deep_research 的触发门槛。
+        """
+        normalized_query = (query or "").strip().lower()
+        if not normalized_query:
+            return False
+
+        has_deep_research = any(
+            node.task_type in {"deep_research", "deeper_research"}
+            for node in plan_spec.task_graph.nodes
+        )
+        if not has_deep_research:
+            return False
+
+        # 显式研究型意图保留深度研究能力。
+        research_patterns = [
+            r"深入",
+            r"详细",
+            r"系统",
+            r"综述",
+            r"调研",
+            r"研究现状",
+            r"发展趋势",
+            r"多角度",
+            r"案例分析",
+            r"完整报告",
+            r"comprehensive",
+            r"survey",
+            r"in-depth",
+        ]
+        if any(re.search(pattern, normalized_query) for pattern in research_patterns):
+            return False
+
+        # 定义解释型问答默认走轻路径。
+        explainer_patterns = [
+            r"什么是",
+            r"为什么",
+            r"如何",
+            r"区别",
+            r"定义",
+            r"意义",
+            r"作用",
+            r"原理",
+            r"特点",
+            r"适用",
+            r"what is",
+            r"why",
+            r"how",
+        ]
+        looks_like_explainer = any(
+            re.search(pattern, normalized_query) for pattern in explainer_patterns
+        )
+        if not looks_like_explainer:
+            return False
+
+        lightweight_task_count = sum(
+            1
+            for node in plan_spec.task_graph.nodes
+            if node.task_type in {"local_search", "global_search", "hybrid_search", "naive_search"}
+        )
+        return lightweight_task_count >= 1
 
     def _ensure_plan_context(self, state: PlanExecuteState) -> PlanContext:
         """

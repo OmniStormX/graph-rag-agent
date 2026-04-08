@@ -602,7 +602,7 @@ async def process_chat_stream(
             return
         
         # 对于其他Agent类型，使用标准流式处理
-        if agent_type in ["hybrid_agent", "graph_agent", "naive_rag_agent"]:
+        if agent_type in ["hybrid_agent", "graph_agent", "naive_rag_agent", "fusion_agent"]:
             # 为调试模式收集执行轨迹
             if debug:
                 # 首先获取执行轨迹

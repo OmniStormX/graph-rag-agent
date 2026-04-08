@@ -17,6 +17,115 @@ def render_assistant_markdown(content: str):
     st.markdown(rendered_content, unsafe_allow_html=True)
 
 
+def _format_stream_event_line(event: dict) -> str:
+    """格式化流式事件为前端可读文本。"""
+    status = event.get("status")
+    if status == "planning":
+        if event.get("phase") == "complete":
+            tasks = event.get("plan", {}).get("tasks", [])
+            return f"规划完成，生成 {len(tasks)} 个任务"
+        return event.get("content", "正在规划任务")
+    if status == "reporting":
+        return event.get("content", "正在生成最终回答")
+    if status == "task_progress":
+        tool = event.get("tool", "task")
+        description = event.get("description", "")
+        if event.get("phase") == "start":
+            return f"执行中: {tool} - {description}"
+        latency = event.get("latency_seconds")
+        evidence_count = event.get("evidence_count")
+        if event.get("phase") == "complete":
+            return f"已完成: {tool} ({latency}s, 证据 {evidence_count})"
+        return f"执行失败: {tool}"
+    if status == "stage":
+        return event.get("content", "")
+    return event.get("content", "")
+
+
+def _build_stream_event_summary(stream_events: list[dict]) -> list[str]:
+    """将事件流聚合为紧凑摘要，避免逐条刷屏。"""
+    if not stream_events:
+        return []
+
+    summary_lines: list[str] = []
+    latest_task_state: dict[str, dict] = {}
+    latest_plan: dict | None = None
+    latest_reporting: str | None = None
+
+    for event in stream_events:
+        status = event.get("status")
+        if status == "planning":
+            latest_plan = event
+        elif status == "task_progress":
+            task_id = event.get("task_id")
+            if task_id:
+                latest_task_state[task_id] = event
+        elif status == "reporting":
+            latest_reporting = event.get("content", "正在生成最终回答")
+        elif status == "stage":
+            content = event.get("content")
+            if content:
+                summary_lines.append(content)
+
+    if latest_plan:
+        tasks = latest_plan.get("plan", {}).get("tasks", [])
+        if latest_plan.get("phase") == "complete":
+            summary_lines.append(f"规划: {len(tasks)} 个任务")
+        else:
+            summary_lines.append(latest_plan.get("content", "正在规划任务"))
+
+    completed_count = 0
+    running_line = None
+    failed_count = 0
+    for task_id, event in latest_task_state.items():
+        phase = event.get("phase")
+        tool = event.get("tool", "task")
+        if phase == "complete":
+            completed_count += 1
+        elif phase == "start":
+            running_line = f"执行中: {tool}"
+        elif phase == "failed":
+            failed_count += 1
+
+    if latest_task_state:
+        summary_lines.append(
+            f"任务: 完成 {completed_count}/{len(latest_task_state)}"
+            + (f"，失败 {failed_count}" if failed_count else "")
+        )
+    if running_line:
+        summary_lines.append(running_line)
+
+    # 额外展示最近完成的几个任务，帮助用户感知进展。
+    recent_completed = [
+        event for event in latest_task_state.values()
+        if event.get("phase") == "complete"
+    ]
+    recent_completed.sort(key=lambda item: item.get("latency_seconds", 0), reverse=True)
+    for event in recent_completed[:3]:
+        tool = event.get("tool", "task")
+        latency = event.get("latency_seconds")
+        evidence_count = event.get("evidence_count", 0)
+        summary_lines.append(f"完成: {tool} ({latency}s, 证据 {evidence_count})")
+
+    if latest_reporting:
+        summary_lines.append(latest_reporting)
+
+    deduped_lines: list[str] = []
+    for line in summary_lines:
+        if line and line not in deduped_lines:
+            deduped_lines.append(line)
+    return deduped_lines[-6:]
+
+
+def render_stream_events(stream_events: list[dict]):
+    """渲染消息关联的流式执行摘要。"""
+    lines = _build_stream_event_summary(stream_events)
+    if not lines:
+        return
+    summary = "\n".join([f"- {line}" for line in lines[-8:]])
+    st.markdown(summary)
+
+
 def render_evidence_footnotes(content: str, message_index: int):
     """在回答底部渲染脚注形式的证据信息。"""
     footnotes = build_footnote_entries(content)
@@ -143,6 +252,7 @@ def display_chat_interface():
                 # 处理deep_research_agent的思考过程
                 if msg["role"] == "assistant":
                     assistant_display_content = content
+                    render_stream_events(msg.get("stream_events", []))
                     # 判断是否需要显示思考过程
                     show_thinking = (st.session_state.agent_type == "deep_research_agent" and 
                                     st.session_state.get("show_thinking", False))
@@ -384,9 +494,11 @@ def display_chat_interface():
             with st.chat_message("assistant"):
                 try:
                     # 初始化流式响应的占位符
+                    progress_placeholder = st.empty()
                     message_placeholder = st.empty()
                     full_response = ""
                     thinking_content = ""
+                    stream_events = []
                     
                     # 检查流式响应是否启用 (当调试模式禁用时)
                     use_stream = st.session_state.get("use_stream", True) and not st.session_state.debug_mode
@@ -431,15 +543,18 @@ def display_chat_interface():
                                 print(f"处理令牌出错: {str(e)}")
 
                         def handle_stream_event(event):
-                            """处理流式状态事件，避免混入正文渲染。"""
+                            """处理流式状态事件，并展示 Fusion 等模式的中间阶段。"""
                             nonlocal full_response
-                            if event.get("status") != "stage":
+                            if event.get("status") in {"kg_cache_ready"}:
                                 return
-                            if full_response:
-                                return
-                            stage_text = event.get("content", "")
-                            if stage_text:
-                                message_placeholder.markdown(f"*{stage_text}...*")
+                            stream_events.append(event)
+                            lines = _build_stream_event_summary(stream_events)
+                            if lines:
+                                progress_placeholder.markdown("\n".join([f"- {line}" for line in lines[-8:]]))
+                            if event.get("status") == "stage" and not full_response:
+                                stage_text = event.get("content", "")
+                                if stage_text:
+                                    message_placeholder.markdown(f"*{stage_text}...*")
                         
                         # 使用流式 API
                         with st.spinner("思考中..."):
@@ -474,6 +589,11 @@ def display_chat_interface():
                             render_answer_with_hover_citations(full_response),
                             unsafe_allow_html=True,
                         )
+                        if stream_events:
+                            progress_placeholder.markdown("\n".join([
+                                f"- {line}"
+                                for line in _build_stream_event_summary(stream_events)
+                            ]))
                         
                         # 创建消息对象
                         message_obj = {
@@ -481,6 +601,7 @@ def display_chat_interface():
                             "content": full_response,
                             "message_id": str(uuid.uuid4()),
                             "kg_cache_key": stream_meta.get("kg_cache_key") if stream_meta else None,
+                            "stream_events": stream_meta.get("events", stream_events) if stream_meta else stream_events,
                         }
                         
                         # 如果有思考内容，添加到消息中
@@ -510,6 +631,7 @@ def display_chat_interface():
                                 "content": answer,
                                 "message_id": str(uuid.uuid4()),
                                 "kg_cache_key": response.get("kg_cache_key"),
+                                "stream_events": response.get("stream_events", []),
                             }
                             
                             # 如果有思考内容，添加到消息中

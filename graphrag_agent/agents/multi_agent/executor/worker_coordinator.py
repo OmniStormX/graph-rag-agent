@@ -4,7 +4,7 @@
 根据 PlanExecutionSignal 调度不同类型的 Worker 执行任务，支持串行与并行模式。
 """
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, Any
 import logging
 
 from graphrag_agent.agents.multi_agent.core.execution_record import (
@@ -78,6 +78,7 @@ class WorkerCoordinator:
         self,
         state: PlanExecuteState,
         signal: PlanExecutionSignal,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> List[ExecutionRecord]:
         """根据计划信号执行所有任务，返回执行记录列表。"""
         task_map = self._prepare_tasks(signal)
@@ -87,9 +88,9 @@ class WorkerCoordinator:
 
         effective_mode = self._resolve_execution_mode(signal.execution_mode)
         if effective_mode == "parallel":
-            results = self._execute_parallel(state, signal, task_map)
+            results = self._execute_parallel(state, signal, task_map, progress_callback)
         else:
-            results = self._execute_sequential(state, signal, task_map)
+            results = self._execute_sequential(state, signal, task_map, progress_callback)
 
         if state.plan is not None:
             node_status = [node.status for node in state.plan.task_graph.nodes]
@@ -129,6 +130,7 @@ class WorkerCoordinator:
         state: PlanExecuteState,
         signal: PlanExecutionSignal,
         task_map: Dict[str, TaskNode],
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]],
     ) -> List[ExecutionRecord]:
         results: List[ExecutionRecord] = []
         sequence = signal.execution_sequence or list(task_map.keys())
@@ -144,6 +146,7 @@ class WorkerCoordinator:
                 task_map=task_map,
                 results=results,
                 skip_dependency_check=False,
+                progress_callback=progress_callback,
             )
         return results
 
@@ -152,6 +155,7 @@ class WorkerCoordinator:
         state: PlanExecuteState,
         signal: PlanExecutionSignal,
         task_map: Dict[str, TaskNode],
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]],
     ) -> List[ExecutionRecord]:
         results: List[ExecutionRecord] = []
         sequence = signal.execution_sequence or list(task_map.keys())
@@ -191,6 +195,7 @@ class WorkerCoordinator:
                             task_map=task_map,
                             results=results,
                             skip_dependency_check=True,
+                            progress_callback=progress_callback,
                         )
                         inflight[future] = task_id
                         task_status[task_id] = "running"
@@ -264,6 +269,7 @@ class WorkerCoordinator:
         task_map: Dict[str, TaskNode],
         results: List[ExecutionRecord],
         skip_dependency_check: bool,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]],
     ) -> Tuple[bool, Optional[str]]:
         if not skip_dependency_check:
             dependency_ok, dependency_error, failure_reason = self._check_dependencies(task, state)
@@ -298,6 +304,17 @@ class WorkerCoordinator:
             if state.plan is not None:
                 state.plan.update_task_status(task.task_id, "running")
 
+            self._emit_progress(
+                progress_callback,
+                {
+                    "status": "task_progress",
+                    "phase": "start",
+                    "task_id": task.task_id,
+                    "tool": task.task_type,
+                    "description": task.description,
+                    "content": f"正在执行 {task.task_type}: {task.description}",
+                },
+            )
             exec_result = executor.execute_task(task, state, signal)
             results.append(exec_result.record)
 
@@ -318,7 +335,28 @@ class WorkerCoordinator:
                     exec_result = retry_result
 
             if exec_result.success:
+                self._emit_progress(
+                    progress_callback,
+                    self._build_task_progress_event(
+                        exec_result.record,
+                        task,
+                        phase="complete",
+                        content=f"已完成 {task.task_type}",
+                        success=True,
+                    ),
+                )
                 return True, None
+            self._emit_progress(
+                progress_callback,
+                self._build_task_progress_event(
+                    exec_result.record,
+                    task,
+                    phase="failed",
+                    content=f"{task.task_type} 执行失败",
+                    success=False,
+                    error=exec_result.error,
+                ),
+            )
             return False, exec_result.error or "execution_failed"
 
         except Exception as exc:  # noqa: BLE001
@@ -330,7 +368,59 @@ class WorkerCoordinator:
                 failure_reason="execution_exception",
             )
             results.append(failure_record)
+            self._emit_progress(
+                progress_callback,
+                self._build_task_progress_event(
+                    failure_record,
+                    task,
+                    phase="failed",
+                    content=f"{task.task_type} 执行异常",
+                    success=False,
+                    error=str(exc),
+                ),
+            )
             return False, "execution_exception"
+
+    def _emit_progress(
+        self,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]],
+        event: Dict[str, Any],
+    ) -> None:
+        """向上层发送任务级进度事件。"""
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(event)
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug("任务进度回调失败: %s", exc)
+
+    def _build_task_progress_event(
+        self,
+        record: ExecutionRecord,
+        task: TaskNode,
+        *,
+        phase: str,
+        content: str,
+        success: bool,
+        error: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """构造前端可直接消费的任务进度事件。"""
+        tool_name = task.task_type
+        if record.tool_calls:
+            tool_name = record.tool_calls[0].tool_name or tool_name
+        return {
+            "status": "task_progress",
+            "phase": phase,
+            "task_id": task.task_id,
+            "tool": tool_name,
+            "worker_type": record.worker_type,
+            "description": task.description,
+            "latency_seconds": round(record.metadata.latency_seconds, 3),
+            "evidence_count": len(record.evidence),
+            "success": success,
+            "error": error,
+            "content": content,
+        }
 
     def _prepare_tasks(self, signal: PlanExecutionSignal) -> Dict[str, TaskNode]:
         """将信号中的任务恢复为TaskNode对象"""

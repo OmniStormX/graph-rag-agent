@@ -4,7 +4,7 @@
 负责串联 Planner → WorkerCoordinator → Reporter，形成完整的
 Plan-Execute-Report 生命周期。
 """
-from typing import List, Optional, Sequence, Literal, Dict, Any
+from typing import Callable, List, Optional, Sequence, Literal, Dict, Any
 import logging
 import time
 import json
@@ -111,6 +111,7 @@ class MultiAgentOrchestrator:
         *,
         assumptions: Optional[Sequence[str]] = None,
         report_type: Optional[str] = None,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> OrchestratorResult:
         """
         执行完整的 Plan-Execute-Report 流程
@@ -120,6 +121,14 @@ class MultiAgentOrchestrator:
 
         # --- Plan ---
         plan_start = time.perf_counter()
+        self._emit_progress(
+            progress_callback,
+            {
+                "status": "planning",
+                "phase": "start",
+                "content": "正在规划任务",
+            },
+        )
         try:
             planner_result = self._planner.generate_plan(
                 state,
@@ -140,6 +149,16 @@ class MultiAgentOrchestrator:
         metrics.planning_seconds = time.perf_counter() - plan_start
 
         self._print_plan_summary(planner_result)
+        if planner_result.plan_spec is not None:
+            self._emit_progress(
+                progress_callback,
+                {
+                    "status": "planning",
+                    "phase": "complete",
+                    "content": f"已生成 {len(planner_result.plan_spec.task_graph.nodes)} 个任务",
+                    "plan": self._build_plan_summary_payload(planner_result),
+                },
+            )
 
         if planner_result.plan_spec is None:
             status = "needs_clarification"
@@ -175,8 +194,20 @@ class MultiAgentOrchestrator:
         execution_records: List[ExecutionRecord] = []
         if signal is not None:
             exec_start = time.perf_counter()
+            self._emit_progress(
+                progress_callback,
+                {
+                    "status": "stage",
+                    "stage": "executing",
+                    "content": "正在执行规划任务",
+                },
+            )
             try:
-                execution_records = self._worker.execute_plan(state, signal)
+                execution_records = self._worker.execute_plan(
+                    state,
+                    signal,
+                    progress_callback=progress_callback,
+                )
             except Exception as exc:  # noqa: BLE001
                 _LOGGER.exception("执行阶段失败: %s", exc)
                 errors.append(f"执行阶段失败: {exc}")
@@ -188,6 +219,14 @@ class MultiAgentOrchestrator:
         report_result: Optional[ReportResult] = None
         if self.config.auto_generate_report and not errors:
             report_start = time.perf_counter()
+            self._emit_progress(
+                progress_callback,
+                {
+                    "status": "reporting",
+                    "phase": "start",
+                    "content": "正在汇总证据并生成最终回答",
+                },
+            )
             try:
                 report_result = self._reporter.generate_report(
                     state,
@@ -195,6 +234,15 @@ class MultiAgentOrchestrator:
                 )
                 if report_result is not None:
                     self._print_report_summary(report_result)
+                    self._emit_progress(
+                        progress_callback,
+                        {
+                            "status": "reporting",
+                            "phase": "complete",
+                            "content": "报告生成完成，准备输出回答",
+                            "section_count": len(report_result.sections or []),
+                        },
+                    )
             except Exception as exc:  # noqa: BLE001
                 _LOGGER.exception("报告生成失败: %s", exc)
                 errors.append(f"报告生成失败: {exc}")
@@ -223,6 +271,42 @@ class MultiAgentOrchestrator:
             errors=errors,
             metrics=metrics,
         )
+
+    def _emit_progress(
+        self,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]],
+        event: Dict[str, Any],
+    ) -> None:
+        """向上层发送结构化进度事件。"""
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(event)
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug("进度事件回调失败: %s", exc)
+
+    def _build_plan_summary_payload(
+        self,
+        planner_result: PlannerResult,
+    ) -> Dict[str, Any]:
+        """构造适合前端展示的规划摘要。"""
+        plan = planner_result.plan_spec
+        if plan is None:
+            return {}
+        return {
+            "plan_id": plan.plan_id,
+            "execution_mode": plan.task_graph.execution_mode,
+            "tasks": [
+                {
+                    "task_id": node.task_id,
+                    "description": node.description,
+                    "tool": node.task_type,
+                    "priority": node.priority,
+                    "depends_on": node.depends_on,
+                }
+                for node in plan.task_graph.nodes
+            ],
+        }
 
     def _print_plan_summary(self, planner_result: PlannerResult) -> None:
         """

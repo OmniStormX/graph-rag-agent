@@ -87,8 +87,9 @@ def send_message_stream(
             return {
                 "raw_thinking": response.get("raw_thinking", ""),
                 "kg_cache_key": response.get("kg_cache_key"),
+                "events": response.get("stream_events", []),
             }
-        return {"raw_thinking": "", "kg_cache_key": None}
+        return {"raw_thinking": "", "kg_cache_key": None, "events": []}
         
     try:
         # 构建请求参数
@@ -129,6 +130,7 @@ def send_message_stream(
         stream_meta = {
             "raw_thinking": "",
             "kg_cache_key": None,
+            "events": [],
         }
         
         for event in client.events():
@@ -145,6 +147,11 @@ def send_message_stream(
                     # 模型输出的令牌
                     on_token(data.get("content", ""))
                 elif data.get("status") == "stage":
+                    stream_meta["events"].append(data)
+                    if on_event:
+                        on_event(data)
+                elif data.get("status") in {"planning", "task_progress", "reporting"}:
+                    stream_meta["events"].append(data)
                     if on_event:
                         on_event(data)
                 elif data.get("status") == "thinking":
@@ -182,7 +189,7 @@ def send_message_stream(
         # 处理连接错误
         on_token(f"\n\n连接错误: {str(e)}")
         print(f"流式API连接错误: {str(e)}")
-        return {"raw_thinking": "", "kg_cache_key": None, "error": str(e)}
+        return {"raw_thinking": "", "kg_cache_key": None, "events": [], "error": str(e)}
 
 @monitor_performance(endpoint="send_feedback")
 def send_feedback(message_id: str, query: str, is_positive: bool, thread_id: str, agent_type: str = "graph_agent"):

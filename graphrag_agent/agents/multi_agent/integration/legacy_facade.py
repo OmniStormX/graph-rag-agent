@@ -4,7 +4,7 @@
 旧版协调器通过 ``process_query`` 返回答案和调试信息。本文件提供等价
 接口，但实际执行委托给新的 Plan-Execute-Report 流程。
 """
-from typing import Any, Dict, Iterable, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, Optional, Sequence
 
 from langchain_core.messages import HumanMessage
 
@@ -38,6 +38,7 @@ class MultiAgentFacade:
         assumptions: Optional[Sequence[str]] = None,
         report_type: Optional[str] = None,
         extra_messages: Optional[Iterable[HumanMessage]] = None,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Dict[str, Any]:
         """执行多智能体流程，并返回与旧协调器兼容的结构化结果。"""
         state = self._build_state(query, extra_messages)
@@ -45,6 +46,7 @@ class MultiAgentFacade:
             state,
             assumptions=assumptions,
             report_type=report_type,
+            progress_callback=progress_callback,
         )
         return self._format_result(state, result)
 

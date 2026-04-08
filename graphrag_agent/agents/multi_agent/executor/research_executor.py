@@ -41,6 +41,7 @@ class ResearchExecutor(BaseExecutor):
 
     worker_type: str = "research_executor"
     SUPPORTED_TASKS = {"deep_research", "deeper_research"}
+    LIGHTWEIGHT_MAX_ITERATIONS = 2
 
     def __init__(self, config: Optional[ExecutorConfig] = None) -> None:
         super().__init__(config)
@@ -66,7 +67,7 @@ class ResearchExecutor(BaseExecutor):
         result_payload: Any = None
 
         try:
-            result_payload = tool.search(payload)
+            result_payload = self._execute_with_budget_control(tool, payload)
         except Exception as exc:  # noqa: BLE001
             success = False
             error_message = str(exc)
@@ -102,6 +103,7 @@ class ResearchExecutor(BaseExecutor):
             environment={
                 "execution_mode": signal.execution_mode,
                 "references": references,
+                "lightweight_preference": bool(payload.get("lightweight_preference")),
             },
         )
 
@@ -130,6 +132,80 @@ class ResearchExecutor(BaseExecutor):
         )
 
         return TaskExecutionResult(record=record, success=success, error=error_message)
+
+    def _execute_with_budget_control(
+        self,
+        tool: Any,
+        payload: Dict[str, Any],
+    ) -> Any:
+        """
+        在保留研究任务语义的前提下，根据轻量偏好临时收紧研究预算。
+
+        说明：
+            这里只控制执行预算，不改写任务类型，避免绕过研究执行器。
+        """
+        if not payload.get("lightweight_preference"):
+            return tool.search(payload)
+
+        restore_actions = self._apply_lightweight_budget(tool)
+        try:
+            return tool.search(payload)
+        finally:
+            for restore in reversed(restore_actions):
+                restore()
+
+    def _apply_lightweight_budget(self, tool: Any) -> List[Any]:
+        """
+        对研究工具施加临时轻量预算，并返回恢复动作列表。
+        """
+        restore_actions: List[Any] = []
+        restore_actions.extend(
+            self._cap_int_attr(tool, "max_iterations", self.LIGHTWEIGHT_MAX_ITERATIONS)
+        )
+
+        nested_deep_research = getattr(tool, "deep_research", None)
+        if nested_deep_research is not None:
+            restore_actions.extend(
+                self._cap_int_attr(
+                    nested_deep_research,
+                    "max_iterations",
+                    self.LIGHTWEIGHT_MAX_ITERATIONS,
+                )
+            )
+
+        return restore_actions
+
+    def _cap_int_attr(
+        self,
+        target: Any,
+        attr_name: str,
+        limit: int,
+    ) -> List[Any]:
+        """
+        将目标对象上的整数属性临时收紧到上限，并返回恢复闭包。
+        """
+        if target is None or not hasattr(target, attr_name):
+            return []
+
+        original_value = getattr(target, attr_name)
+        if not isinstance(original_value, int):
+            return []
+        if original_value <= limit:
+            return []
+
+        setattr(target, attr_name, limit)
+        _LOGGER.info(
+            "研究任务启用轻量预算: target=%s attr=%s original=%s limited=%s",
+            target.__class__.__name__,
+            attr_name,
+            original_value,
+            limit,
+        )
+
+        def _restore() -> None:
+            setattr(target, attr_name, original_value)
+
+        return [_restore]
 
     def _get_tool_instance(self, task_type: str) -> Any:
         if task_type not in self._tool_cache:
