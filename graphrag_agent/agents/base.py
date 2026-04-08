@@ -1,6 +1,6 @@
 from typing import Annotated, Sequence, TypedDict, List, Dict, Any, AsyncGenerator, Optional
 from abc import ABC, abstractmethod
-from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langgraph.graph import END, StateGraph, START
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.checkpoint.memory import MemorySaver
@@ -8,6 +8,8 @@ from langgraph.graph.message import add_messages
 import pprint
 import time
 import asyncio
+import json
+import re
 
 from graphrag_agent.models.get_models import get_llm_model, get_stream_llm_model, get_embeddings_model
 from graphrag_agent.runtime_logging import emit_runtime_log, shorten_text
@@ -119,8 +121,169 @@ class BaseAgent(ABC):
         
         # 编译图
         self.graph = workflow.compile(checkpointer=self.memory)
+
+    def _make_stream_event(self, status: str, **fields: Any) -> Dict[str, Any]:
+        """构造统一的流式事件负载。"""
+        return {"status": status, **fields}
+
+    def _make_stage_event(
+        self,
+        stage: str,
+        content: str,
+        **fields: Any,
+    ) -> Dict[str, Any]:
+        """构造阶段事件，便于前后端统一处理。"""
+        return self._make_stream_event("stage", stage=stage, content=content, **fields)
+
+    def _split_text_for_stream(self, text: str) -> List[str]:
+        """按自然语言边界切分文本，复用于缓存回放与降级输出。"""
+        if not text:
+            return []
+
+        parts = re.split(r'([.!?。！？]\s*)', text)
+        chunks: List[str] = []
+        buffer = ""
+
+        for index, part in enumerate(parts):
+            if not part:
+                continue
+            buffer += part
+            if (index % 2 == 1) or len(buffer) >= self.stream_flush_threshold:
+                chunks.append(buffer)
+                buffer = ""
+
+        if buffer:
+            chunks.append(buffer)
+
+        return chunks
+
+    async def _replay_text_stream(
+        self,
+        text: str,
+        *,
+        sleep_interval: float = 0.01,
+    ) -> AsyncGenerator[str, None]:
+        """将已有文本按块回放为流。"""
+        for chunk in self._split_text_for_stream(text):
+            yield chunk
+            await asyncio.sleep(sleep_interval)
+
+    async def _agent_node_async(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """在线程池中执行 agent 节点，避免阻塞事件循环。"""
+        return await asyncio.get_event_loop().run_in_executor(None, self._agent_node, state)
+
+    def _extract_tool_calls(self, message: BaseMessage) -> List[Dict[str, Any]]:
+        """统一解析 AIMessage 中的工具调用。"""
+        tool_calls = []
+
+        if hasattr(message, "tool_calls") and getattr(message, "tool_calls"):
+            raw_tool_calls = getattr(message, "tool_calls")
+            if isinstance(raw_tool_calls, list):
+                for tool_call in raw_tool_calls:
+                    if isinstance(tool_call, dict):
+                        tool_calls.append(tool_call)
+
+        if tool_calls:
+            return tool_calls
+
+        if hasattr(message, "additional_kwargs") and getattr(message, "additional_kwargs"):
+            raw_tool_calls = message.additional_kwargs.get("tool_calls", [])
+            if isinstance(raw_tool_calls, list):
+                for tool_call in raw_tool_calls:
+                    if isinstance(tool_call, dict):
+                        tool_calls.append(tool_call)
+
+        return tool_calls
+
+    def _normalize_tool_input(self, tool_call: Dict[str, Any]) -> tuple[str, Any, str]:
+        """规范化工具调用名称、参数与调用ID。"""
+        tool_name = tool_call.get("name", "")
+        tool_args: Any = tool_call.get("args", {})
+        tool_call_id = tool_call.get("id", "tool_call_0")
+
+        function_payload = tool_call.get("function")
+        if isinstance(function_payload, dict):
+            tool_name = function_payload.get("name", tool_name)
+            tool_args = function_payload.get("arguments", tool_args)
+
+        if isinstance(tool_args, str):
+            try:
+                tool_args = json.loads(tool_args)
+            except json.JSONDecodeError:
+                tool_args = {"query": tool_args}
+
+        if not isinstance(tool_args, dict):
+            tool_args = {"query": str(tool_args)}
+
+        return tool_name, tool_args, tool_call_id
+
+    def _get_tool_registry(self) -> Dict[str, Any]:
+        """构建名称到工具实例的映射。"""
+        registry: Dict[str, Any] = {}
+        for tool in self.tools:
+            tool_name = getattr(tool, "name", None)
+            if tool_name:
+                registry[tool_name] = tool
+            elif callable(tool):
+                registry[getattr(tool, "__name__", tool.__class__.__name__)] = tool
+        return registry
+
+    async def _invoke_tool_async(self, tool: Any, tool_input: Any) -> Any:
+        """在线程池中执行工具调用。"""
+        loop = asyncio.get_event_loop()
+
+        def invoke_tool() -> Any:
+            normalized_input = tool_input
+            if isinstance(tool_input, dict):
+                if "query" in tool_input and len(tool_input) == 1:
+                    normalized_input = tool_input["query"]
+                elif "input" in tool_input and len(tool_input) == 1:
+                    normalized_input = tool_input["input"]
+            if hasattr(tool, "invoke"):
+                return tool.invoke(normalized_input)
+            if callable(tool):
+                if isinstance(normalized_input, dict):
+                    if "query" in normalized_input:
+                        return tool(normalized_input["query"])
+                    if "input" in normalized_input:
+                        return tool(normalized_input["input"])
+                return tool(normalized_input)
+            raise TypeError(f"不支持的工具类型: {type(tool)}")
+
+        return await loop.run_in_executor(None, invoke_tool)
+
+    async def _run_retrieval_step(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """执行统一的工具检索步骤，返回 ToolMessage 列表。"""
+        last_message = state["messages"][-1]
+        tool_calls = self._extract_tool_calls(last_message)
+        if not tool_calls:
+            raise ValueError("未找到可执行的工具调用")
+
+        tool_registry = self._get_tool_registry()
+        tool_messages: List[ToolMessage] = []
+
+        for tool_call in tool_calls:
+            tool_name, tool_args, tool_call_id = self._normalize_tool_input(tool_call)
+            tool = tool_registry.get(tool_name)
+            if tool is None:
+                raise ValueError(f"未注册的工具: {tool_name}")
+
+            tool_result = await self._invoke_tool_async(tool, tool_args)
+            tool_messages.append(
+                ToolMessage(
+                    content=tool_result,
+                    tool_call_id=tool_call_id,
+                    name=tool_name,
+                )
+            )
+
+        return {"messages": tool_messages}
+
+    def _route_stream_after_retrieval(self, state: Dict[str, Any]) -> str:
+        """决定检索后的流式节点路由，默认直接进入生成。"""
+        return "generate"
     
-    async def _stream_process(self, inputs: Dict[str, Any], config: Dict[str, Any]) -> AsyncGenerator[str, None]:
+    async def _stream_process(self, inputs: Dict[str, Any], config: Dict[str, Any]) -> AsyncGenerator[Any, None]:
         """
         执行流式处理的默认实现
         
@@ -133,43 +296,38 @@ class BaseAgent(ABC):
         返回:
             AsyncGenerator[str, None]: 流式响应生成器
         """
-        # 获取消息
-        messages = inputs.get("messages", [])
-        query = messages[-1].content if messages else ""
-        
-        # 构建状态字典
+        messages = list(inputs.get("messages", []))
         state = {
             "messages": messages,
-            "configurable": config.get("configurable", {})
+            "configurable": config.get("configurable", {}),
         }
-        
-        # 获取生成结果
-        result = await self._generate_node_async(state)
-        
-        if "messages" in result and result["messages"]:
-            message = result["messages"][0]
-            content = message.content if hasattr(message, "content") else str(message)
-            
-            # 按句子或段落分块，更自然
-            import re
-            chunks = re.split(r'([.!?。！？]\s*)', content)
-            buffer = ""
-            
-            for i in range(0, len(chunks)):
-                if i < len(chunks):
-                    buffer += chunks[i]
-                    
-                    # 当缓冲区包含完整句子或达到合理大小时输出
-                    if (i % 2 == 1) or len(buffer) >= self.stream_flush_threshold:
-                        yield buffer
-                        buffer = ""
-                        await asyncio.sleep(0.01)  # 微小延迟确保流畅显示
-            
-            # 输出任何剩余内容
-            if buffer:
-                yield buffer
-        else:
-            yield "无法生成响应。"
+
+        yield self._make_stage_event("agent", "正在分析问题")
+        agent_output = await self._agent_node_async(state)
+        state["messages"] = state["messages"] + agent_output.get("messages", [])
+
+        tool_decision = tools_condition({"messages": state["messages"]})
+        if tool_decision != "tools":
+            final_message = state["messages"][-1]
+            content = final_message.content if hasattr(final_message, "content") else str(final_message)
+            async for chunk in self._replay_text_stream(content, sleep_interval=0):
+                yield chunk
+            return
+
+        yield self._make_stage_event("retrieve", "正在检索相关信息")
+        retrieve_output = await self._run_retrieval_step(state)
+        state["messages"] = state["messages"] + retrieve_output.get("messages", [])
+
+        next_node = self._route_stream_after_retrieval(state)
+        if next_node == "reduce":
+            yield self._make_stage_event("reduce", "正在归纳检索结果")
+            async for chunk in self._reduce_node_stream(state):
+                yield chunk
+            return
+
+        yield self._make_stage_event("generate", "正在生成回答")
+        async for chunk in self._generate_node_stream(state):
+            yield chunk
 
     
     @abstractmethod
@@ -278,6 +436,10 @@ class BaseAgent(ABC):
             for i in range(0, len(content), self.chunk_size):
                 yield content[i:i+self.chunk_size]
                 await asyncio.sleep(0.01)
+
+    async def _reduce_node_stream(self, state: Dict[str, Any]) -> AsyncGenerator[str, None]:
+        """Reduce 节点的默认流式实现，默认回退为同步生成后分块。"""
+        raise NotImplementedError("当前 Agent 未实现 reduce 流式输出")
     
     async def _generate_node_async(self, state):
         """
@@ -629,7 +791,7 @@ class BaseAgent(ABC):
             )
             return f"抱歉，处理您的问题时遇到了错误。请稍后再试或换一种提问方式。错误详情: {str(e)}"
     
-    async def ask_stream(self, query: str, thread_id: str = "default", recursion_limit: Optional[int] = None) -> AsyncGenerator[str, None]:
+    async def ask_stream(self, query: str, thread_id: str = "default", recursion_limit: Optional[int] = None) -> AsyncGenerator[Any, None]:
         """
         向Agent提问，返回流式响应
         
@@ -660,23 +822,9 @@ class BaseAgent(ABC):
             hit=bool(cached_response),
         )
         if cached_response:
-            # 同样按自然语言单位分块
-            import re
-            chunks = re.split(r'([.!?。！？]\s*)', cached_response)
-            buffer = ""
-            
-            for i in range(0, len(chunks)):
-                buffer += chunks[i]
-                
-                # 当缓冲区包含完整句子或达到合理大小时输出
-                if (i % 2 == 1) or len(buffer) >= self.stream_flush_threshold:
-                    yield buffer
-                    buffer = ""
-                    await asyncio.sleep(0.01)
-            
-            # 输出任何剩余内容
-            if buffer:
-                yield buffer
+            yield self._make_stage_event("cache_replay", "命中缓存，正在回放结果", source="cache")
+            async for chunk in self._replay_text_stream(cached_response):
+                yield chunk
             self._log_runtime_event(
                 "agent.ask_stream.cache_hit",
                 thread_id=thread_id,
@@ -712,7 +860,10 @@ class BaseAgent(ABC):
                     )
                     first_chunk_emitted = True
                 yield chunk
-                answer += chunk
+                if isinstance(chunk, str):
+                    answer += chunk
+                elif isinstance(chunk, dict) and chunk.get("status") == "token":
+                    answer += str(chunk.get("content", ""))
             
             # 缓存完整回答 - 同时更新会话缓存和全局缓存
             if answer and len(answer) > 10:

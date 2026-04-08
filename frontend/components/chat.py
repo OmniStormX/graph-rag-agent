@@ -4,7 +4,7 @@ import re
 import json
 import traceback
 from utils.api import send_message, send_feedback, get_source_content, get_knowledge_graph_from_message, get_source_file_info_batch, clear_chat, send_message_stream
-from utils.helpers import extract_source_ids, render_answer_with_hover_citations
+from utils.helpers import build_footnote_entries, extract_source_ids, render_answer_with_hover_citations
 
 def reset_processing_lock():
     """重置处理锁状态"""
@@ -15,6 +15,41 @@ def render_assistant_markdown(content: str):
     """渲染带证据引用悬停样式的回答内容。"""
     rendered_content = render_answer_with_hover_citations(content)
     st.markdown(rendered_content, unsafe_allow_html=True)
+
+
+def render_evidence_footnotes(content: str, message_index: int):
+    """在回答底部渲染脚注形式的证据信息。"""
+    footnotes = build_footnote_entries(content)
+    if not footnotes:
+        return
+
+    source_infos = get_source_file_info_batch([evidence_id for _, _, evidence_id in footnotes])
+
+    with st.container():
+        st.caption("Footnotes")
+        for number, label, evidence_id in footnotes:
+            source_info = source_infos.get(evidence_id, {})
+            display_name = source_info.get("file_name", f"证据 {evidence_id}")
+            st.markdown(
+                (
+                    f"<div class='evidence-footnote-item'>"
+                    f"<sup>{number}</sup> "
+                    f"<strong>{label}</strong><br>"
+                    f"<span style='color:#666;'>{display_name}</span><br>"
+                    f"<span style='color:#888;'>ID: {evidence_id}</span>"
+                    f"</div>"
+                ),
+                unsafe_allow_html=True,
+            )
+
+            source_btn_key = f"footnote_src_{message_index}_{number}_{evidence_id}"
+            if st.button(f"查看原文 [{number}]", key=source_btn_key):
+                with st.spinner(f"加载证据 {number} 原文..."):
+                    source_data = get_source_content(evidence_id)
+                    if source_data and "content" in source_data:
+                        st.session_state.source_content = source_data["content"]
+                        st.session_state.current_tab = "源内容"
+                        st.rerun()
 
 def display_chat_interface():
     """显示主聊天界面"""
@@ -107,6 +142,7 @@ def display_chat_interface():
                 
                 # 处理deep_research_agent的思考过程
                 if msg["role"] == "assistant":
+                    assistant_display_content = content
                     # 判断是否需要显示思考过程
                     show_thinking = (st.session_state.agent_type == "deep_research_agent" and 
                                     st.session_state.get("show_thinking", False))
@@ -116,6 +152,7 @@ def display_chat_interface():
                         # 提取思考过程
                         thinking_process = msg["raw_thinking"]
                         answer_content = msg.get("processed_content", content)
+                        assistant_display_content = answer_content
                         
                         # 格式化思考过程，使用引用格式
                         thinking_lines = thinking_process.split('\n')
@@ -138,6 +175,7 @@ def display_chat_interface():
                             thinking_process = thinking_match.group(1)
                             # 移除思考过程，保留答案
                             answer_content = content.replace(f"<think>{thinking_process}</think>", "").strip()
+                            assistant_display_content = answer_content
                             
                             if show_thinking:
                                 # 显示思考过程（仅当show_thinking为True时）
@@ -159,10 +197,13 @@ def display_chat_interface():
                         else:
                             # 如果提取失败，显示完整内容但移除可能的<think>标签
                             cleaned_content = re.sub(r'<think>|</think>', '', content)
+                            assistant_display_content = cleaned_content
                             render_assistant_markdown(cleaned_content)
                     else:
                         # 普通回答，无思考过程
                         render_assistant_markdown(content)
+
+                    render_evidence_footnotes(assistant_display_content, i)
                 else:
                     # 普通消息直接显示
                     st.markdown(content)
@@ -351,6 +392,7 @@ def display_chat_interface():
                     use_stream = st.session_state.get("use_stream", True) and not st.session_state.debug_mode
                     
                     if use_stream:
+                        stream_meta = {"raw_thinking": "", "kg_cache_key": None}
                         # 定义令牌处理器
                         def handle_token(token, is_thinking=False):
                             nonlocal full_response, thinking_content
@@ -387,11 +429,26 @@ def display_chat_interface():
                                     message_placeholder.markdown(rendered_response + "▌", unsafe_allow_html=True)
                             except Exception as e:
                                 print(f"处理令牌出错: {str(e)}")
+
+                        def handle_stream_event(event):
+                            """处理流式状态事件，避免混入正文渲染。"""
+                            nonlocal full_response
+                            if event.get("status") != "stage":
+                                return
+                            if full_response:
+                                return
+                            stage_text = event.get("content", "")
+                            if stage_text:
+                                message_placeholder.markdown(f"*{stage_text}...*")
                         
                         # 使用流式 API
                         with st.spinner("思考中..."):
                             try:
-                                raw_thinking = send_message_stream(prompt, handle_token)
+                                stream_meta = send_message_stream(
+                                    prompt,
+                                    handle_token,
+                                    handle_stream_event,
+                                )
                                 # 检查是否有响应
                                 if not full_response or full_response.startswith("{") and full_response.endswith("}"):
                                     print("流式响应格式不正确，使用非流式API")
@@ -422,12 +479,16 @@ def display_chat_interface():
                         message_obj = {
                             "role": "assistant",
                             "content": full_response,
-                            "message_id": str(uuid.uuid4())
+                            "message_id": str(uuid.uuid4()),
+                            "kg_cache_key": stream_meta.get("kg_cache_key") if stream_meta else None,
                         }
                         
                         # 如果有思考内容，添加到消息中
                         if thinking_content:
                             message_obj["raw_thinking"] = thinking_content
+                            message_obj["processed_content"] = full_response
+                        elif stream_meta and stream_meta.get("raw_thinking"):
+                            message_obj["raw_thinking"] = stream_meta["raw_thinking"]
                             message_obj["processed_content"] = full_response
                     else:
                         # 使用非流式 API

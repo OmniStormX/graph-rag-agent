@@ -673,11 +673,28 @@ async def process_chat_stream(
             else:
                 # 使用Agent的流式接口
                 answer_generation_start = time.time()
-                answer_chunks = []
+                answer_chunks: List[str] = []
                 first_chunk_sent = False
                 chunk_count = 0
                 async for chunk in selected_agent.ask_stream(message, thread_id=session_id):
-                    answer_chunks.append(chunk)
+                    if isinstance(chunk, dict):
+                        status = chunk.get("status")
+                        if status == "stage":
+                            yield json.dumps(chunk)
+                            continue
+                        if status == "token":
+                            chunk_text = str(chunk.get("content", ""))
+                        else:
+                            # 兼容未来的事件扩展，未知状态直接透传给前端。
+                            yield json.dumps(chunk)
+                            continue
+                    else:
+                        chunk_text = str(chunk)
+
+                    if not chunk_text:
+                        continue
+
+                    answer_chunks.append(chunk_text)
                     if not first_chunk_sent:
                         emit_runtime_log(
                             "chat.stream.first_chunk",
@@ -688,7 +705,7 @@ async def process_chat_stream(
                         )
                         first_chunk_sent = True
                     chunk_count += 1
-                    yield json.dumps({"status": "token", "content": chunk})
+                    yield json.dumps({"status": "token", "content": chunk_text})
                 answer = "".join(answer_chunks)
                 _emit_stage_timing(
                     request_context,

@@ -153,10 +153,20 @@ async def chat_stream(request: Request):
                         except Exception as json_error:
                             print(f"令牌序列化错误: {json_error}")
                 else:
+                    # `process_chat_stream` 可能已经返回 JSON 字符串事件，
+                    # 这里优先按结构化事件透传，避免把 stage/done 等状态再次包成 token。
+                    try:
+                        parsed_chunk = json.loads(chunk)
+                        if isinstance(parsed_chunk, dict) and "status" in parsed_chunk:
+                            yield "data: " + json.dumps(parsed_chunk) + "\n\n"
+                            continue
+                    except (TypeError, json.JSONDecodeError):
+                        pass
+
                     # 普通文本块
                     try:
                         yield "data: " + json.dumps({
-                            "status": "token", 
+                            "status": "token",
                             "content": chunk
                         }) + "\n\n"
                     except Exception as json_error:

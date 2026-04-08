@@ -1,6 +1,6 @@
 import re
 import html
-from typing import List
+from typing import Dict, List, Tuple
 import streamlit as st
 
 def extract_source_ids(answer: str) -> List[str]:
@@ -107,7 +107,9 @@ def render_answer_with_hover_citations(
         return content
 
     rendered = content
-    placeholder_map = {}
+    placeholder_map: Dict[str, str] = {}
+    evidence_order: List[str] = []
+    evidence_index: Dict[str, int] = {}
 
     def _store_placeholder(html_fragment: str) -> str:
         """暂存已生成的 HTML 片段，避免后续正则再次污染。"""
@@ -115,15 +117,22 @@ def render_answer_with_hover_citations(
         placeholder_map[placeholder] = html_fragment
         return placeholder
 
+    def _get_footnote_number(evidence_id: str) -> int:
+        """为证据 ID 分配稳定的脚注编号。"""
+        if evidence_id not in evidence_index:
+            evidence_index[evidence_id] = len(evidence_order) + 1
+            evidence_order.append(evidence_id)
+        return evidence_index[evidence_id]
+
     def _build_highlight_span(keyword: str, evidence_id: str) -> str:
-        """构造仅支持悬停提示的证据关键词高亮。"""
+        """构造纯脚注上标，正文中不再显示证据标签文字。"""
         escaped_id = html.escape(evidence_id, quote=True)
-        escaped_keyword = html.escape(keyword)
+        footnote_number = _get_footnote_number(evidence_id)
 
         html_fragment = (
-            f"<span class='evidence-keyword-highlight' "
-            f"data-evidence-id='证据 ID: {escaped_id}' "
-            f"data-evidence-target='{escaped_id}'>{escaped_keyword}</span>"
+            f"<sup class='evidence-footnote-ref' "
+            f"data-evidence-target='{escaped_id}' "
+            f"title='证据 ID: {escaped_id}'>{footnote_number}</sup>"
         )
         return _store_placeholder(html_fragment)
 
@@ -166,3 +175,61 @@ def render_answer_with_hover_citations(
         rendered = rendered.replace(placeholder, html_fragment)
 
     return rendered
+
+
+def extract_ordered_evidence_entries(answer: str) -> List[Tuple[str, str]]:
+    """按正文出现顺序提取证据条目，用于脚注列表渲染。"""
+    if not isinstance(answer, str) or not answer:
+        return []
+
+    ordered_entries: List[Tuple[str, str]] = []
+
+    def _append_if_missing(label: str, evidence_id: str):
+        """保持顺序去重，避免底部脚注重复。"""
+        clean_id = str(evidence_id).strip()
+        clean_label = str(label).strip() if label else "引用"
+        entry = (clean_label, clean_id)
+        if clean_id and entry not in ordered_entries:
+            ordered_entries.append(entry)
+
+    for match in re.finditer(r"\[\[ref:([^|\]]+)\|([^\]]+)\]\]", answer):
+        _append_if_missing(match.group(1), match.group(2))
+
+    for match in re.finditer(
+        r"([A-Za-z\u4e00-\u9fff0-9_（）()《》“”‘’·\-]{1,24})\s*\[证据ID[:：]\s*([A-Za-z0-9][A-Za-z0-9_-]{5,})\]",
+        answer,
+    ):
+        _append_if_missing(match.group(1), match.group(2))
+
+    for match in re.finditer(
+        r"([A-Za-z\u4e00-\u9fff0-9_（）()《》“”‘’·\-]{1,24})\s*\[([A-Za-z0-9][A-Za-z0-9_-]{7,})\]",
+        answer,
+    ):
+        evidence_id = match.group(1)
+        if not match.group(2).isdigit():
+            _append_if_missing(match.group(1), match.group(2))
+
+    for match in re.finditer(r"\[证据ID[:：]\s*([A-Za-z0-9][A-Za-z0-9_-]{5,})\]", answer):
+        _append_if_missing("引用", match.group(1))
+
+    for match in re.finditer(r"\[([A-Za-z0-9][A-Za-z0-9_-]{7,})\]", answer):
+        evidence_id = match.group(1)
+        if not evidence_id.isdigit():
+            _append_if_missing("引用", evidence_id)
+
+    # 兼容旧格式中尾部的 Chunks 引用列表。
+    for source_id in extract_source_ids(answer):
+        _append_if_missing("Chunks", source_id)
+
+    return ordered_entries
+
+
+def build_footnote_entries(answer: str) -> List[Tuple[int, str, str]]:
+    """构造脚注编号、标签文字与证据 ID 的对应关系。"""
+    return [
+        (index, label, evidence_id)
+        for index, (label, evidence_id) in enumerate(
+            extract_ordered_evidence_entries(answer),
+            start=1,
+        )
+    ]

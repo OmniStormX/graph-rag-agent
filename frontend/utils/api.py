@@ -6,7 +6,7 @@ import json
 import threading
 import time
 import streamlit as st
-from typing import Dict, Callable
+from typing import Any, Callable, Dict, Optional
 from frontend_config.settings import API_URL
 from utils.performance import monitor_performance
 from graphrag_agent.config.settings import community_algorithm
@@ -63,7 +63,11 @@ def send_message(message: str) -> Dict:
         st.error(f"服务器连接错误: {str(e)}")
         return None
 
-def send_message_stream(message: str, on_token: Callable[[str, bool], None]) -> str:
+def send_message_stream(
+    message: str,
+    on_token: Callable[[str, bool], None],
+    on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> Dict[str, Any]:
     """
     向 FastAPI 后端发送聊天消息，获取流式响应
     
@@ -72,17 +76,19 @@ def send_message_stream(message: str, on_token: Callable[[str, bool], None]) -> 
         on_token: 处理令牌的回调函数
         
     Returns:
-        str: 收集的思考内容（如果有）
+        Dict[str, Any]: 流式过程中的附加元数据
     """
     # 如果调试模式启用，直接回退到非流式API
     if st.session_state.debug_mode:
         print("调试模式已启用，使用非流式API")
         response = send_message(message)
         if response and "answer" in response:
-            on_token(response["answer"])
-            # 如果有思考内容，返回它
-            return response.get("raw_thinking", "")
-        return ""
+            on_token(response["answer"], False)
+            return {
+                "raw_thinking": response.get("raw_thinking", ""),
+                "kg_cache_key": response.get("kg_cache_key"),
+            }
+        return {"raw_thinking": "", "kg_cache_key": None}
         
     try:
         # 构建请求参数
@@ -120,6 +126,10 @@ def send_message_stream(message: str, on_token: Callable[[str, bool], None]) -> 
         
         # 处理每个事件
         thinking_content = ""
+        stream_meta = {
+            "raw_thinking": "",
+            "kg_cache_key": None,
+        }
         
         for event in client.events():
             try:
@@ -134,11 +144,18 @@ def send_message_stream(message: str, on_token: Callable[[str, bool], None]) -> 
                 if data.get("status") == "token":
                     # 模型输出的令牌
                     on_token(data.get("content", ""))
+                elif data.get("status") == "stage":
+                    if on_event:
+                        on_event(data)
                 elif data.get("status") == "thinking":
                     # 思考过程块
                     chunk = data.get("content", "")
                     thinking_content += chunk
                     on_token(chunk, is_thinking=True)
+                elif data.get("status") == "kg_cache_ready":
+                    stream_meta["kg_cache_key"] = data.get("kg_cache_key")
+                    if on_event:
+                        on_event(data)
                 elif data.get("status") == "execution_log" and st.session_state.debug_mode:
                     # 处理执行日志
                     if "execution_log" not in st.session_state:
@@ -159,13 +176,13 @@ def send_message_stream(message: str, on_token: Callable[[str, bool], None]) -> 
                 print(f"处理SSE事件时出错: {str(e)}")
                 continue
         
-        # 返回收集的思考内容用于存储
-        return thinking_content
+        stream_meta["raw_thinking"] = thinking_content
+        return stream_meta
     except Exception as e:
         # 处理连接错误
         on_token(f"\n\n连接错误: {str(e)}")
         print(f"流式API连接错误: {str(e)}")
-        return None
+        return {"raw_thinking": "", "kg_cache_key": None, "error": str(e)}
 
 @monitor_performance(endpoint="send_feedback")
 def send_feedback(message_id: str, query: str, is_positive: bool, thread_id: str, agent_type: str = "graph_agent"):
