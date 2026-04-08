@@ -18,6 +18,7 @@ class ChatResponse(BaseModel):
     answer: str
     execution_log: Optional[List[Dict]] = None
     kg_data: Optional[Dict] = None
+    kg_cache_key: Optional[str] = None
     reference: Optional[Dict] = None
     iterations: Optional[List[Dict]] = None
 
@@ -86,6 +87,14 @@ class ReasoningRequest(BaseModel):
     entity_b: Optional[str] = None
     max_depth: Optional[int] = 3
     algorithm: Optional[str] = community_algorithm
+
+
+class KnowledgeGraphFromMessageRequest(BaseModel):
+    """基于回答文本或缓存键获取知识图谱的请求模型。"""
+    session_id: Optional[str] = None
+    message: Optional[str] = None
+    query: Optional[str] = None
+    kg_cache_key: Optional[str] = None
 
 class EntityData(BaseModel):
     id: str

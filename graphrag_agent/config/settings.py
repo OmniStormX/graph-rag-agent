@@ -3,6 +3,13 @@ from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
+from graphrag_agent.config.taxonomy import (
+    ENTITY_TYPE_DEFINITIONS,
+    ENTITY_TYPES,
+    RELATIONSHIP_TYPE_DEFINITIONS,
+    RELATIONSHIP_TYPES,
+    ROOT_ENTITY_LABEL,
+)
 
 # 统一加载环境变量，确保配置来源一致
 load_dotenv()
@@ -60,60 +67,19 @@ FILE_REGISTRY_PATH = PROJECT_ROOT / "file_registry.json"  # 文件注册表路�
 
 # ===== 知识库与系统参数 =====
 
-# 默认知识库主题调整为教材与技术文档，避免图谱 schema
-# 与具体学科绑定过死，便于在讲义、教材、标准说明书中复用。
-KB_NAME = "教材与技术文档"  # 知识库主题，用于 deepsearch
+# 当前分类标准来自《知识分类与标签.xlsx》，知识库主题收敛为工程热力学，
+# 便于抽取阶段输出稳定的实体标签与关系类型。
+KB_NAME = "工程热力学"  # 知识库主题，用于 deepsearch
 workers = _get_env_int("FASTAPI_WORKERS", 2) or 2  # FastAPI 并发进程数
 
 # ===== 知识图谱配置 =====
 
-theme = "教材与技术文档知识体系"  # 知识图谱主题
-
-entity_types = [
-    # 文档结构类实体，便于表达“章节-小节-图表-案例”的组织关系。
-    "章节",
-    "小节",
-    "图表",
-    "案例",
-    # 知识内容类实体，覆盖教材、讲义和技术说明书中的核心知识点。
-    "概念",
-    "原理定律",
-    "物理量",
-    "公式",
-    "变量",
-    "条件",
-    "过程",
-    "状态",
-    "系统对象",
-    "组成部件",
-    "材料介质",
-    # 兜底类型，减少 LLM 因 schema 过窄导致的误分类。
-    "其它",
-]  # 知识图谱实体类型
-
-relationship_types = [
-    # 结构关系。
-    "包含",
-    "属于",
-    # 语义关系。
-    "定义",
-    "遵循",
-    "表示",
-    "使用变量",
-    "单位为",
-    "适用条件",
-    # 机理关系。
-    "导致",
-    "影响",
-    "依赖",
-    "具有状态",
-    # 辅助说明关系。
-    "图示说明",
-    "实例说明",
-    "对比",
-    # 兜底关系，需放在最后一位，与提示词约束保持一致。
-    "其它",
-]  # 知识图谱关系类型
+theme = "工程热力学知识图谱"  # 知识图谱主题
+root_entity_label = ROOT_ENTITY_LABEL  # 领域统一总标签
+entity_types = ENTITY_TYPES  # 主实体标签
+relationship_types = RELATIONSHIP_TYPES  # 标准关系类型
+entity_type_definitions = ENTITY_TYPE_DEFINITIONS  # 实体标签说明
+relationship_type_definitions = RELATIONSHIP_TYPE_DEFINITIONS  # 关系说明
 
 # 冲突解决策略：manual_first / auto_first / merge
 conflict_strategy = os.getenv("GRAPH_CONFLICT_STRATEGY", "manual_first")
@@ -135,24 +101,23 @@ response_type = os.getenv("RESPONSE_TYPE", "多个段落")  # 默认回答形式
 # ===== Agent 工具描述 =====
 
 lc_description = (
-    "用于需要具体知识点与局部证据的查询。检索教材、讲义和技术文档中的定义、公式、变量含义、"
-    "适用条件、组成结构、实验条件与图表说明等细节内容。适用于“某公式中的变量分别表示什么”"
-    "“某个过程适用于什么条件”这类问题。"
+    "用于需要工程热力学细粒度证据的查询。检索概念、定律、物理量、过程、循环、设备、公式和条件"
+    "等节点，回答变量含义、公式适用范围、设备组成、循环差异和推导前提等具体问题。"
 )
 gl_description = (
-    "用于需要总结归纳的查询。分析章节结构、概念体系、原理脉络、过程链路和对象之间的整体关系，"
-    "适用于“这一章的核心知识框架是什么”“某系统由哪些关键部分构成”这类需要系统性整理的问题。"
+    "用于需要全局归纳的查询。分析工程热力学中的概念体系、定律约束、过程链路、循环结构、设备关联"
+    "以及公式与条件之间的整体关系，适合做知识框架梳理和专题综述。"
 )
 naive_description = (
-    "基础检索工具，直接查找与问题最相关的原文片段，不做复杂分析。适合快速定位术语定义、公式出处、"
-    "变量说明、案例描述和技术说明中的原文证据。"
+    "基础检索工具，直接查找与工程热力学问题最相关的原文片段，不做复杂分析。适合快速定位术语定义、"
+    "公式出处、变量说明、设备描述和条件假设。"
 )
 
 examples = [
-    "牛顿第二定律中的各个变量分别表示什么？",
-    "热传导方程适用于哪些条件？",
-    "伯努利方程和连续性方程有什么区别与联系？",
-    "某章节中的系统由哪些关键组成部件构成？",
+    "热力学第一定律如何定义闭口系统中的能量守恒？",
+    "理想气体状态方程在什么条件下有效？",
+    "卡诺循环和朗肯循环的核心差异是什么？",
+    "压缩机通常依赖哪些物理量和前提条件进行分析？",
 ]  # 前端示例问题
 
 # ===== 性能优化配置 =====

@@ -311,7 +311,11 @@ def display_chat_interface():
                                         user_query = st.session_state.messages[i-1]["content"]
                                         
                                     # 使用用户查询来过滤知识图谱
-                                    kg_data = get_knowledge_graph_from_message(msg["content"], user_query)
+                                    kg_data = get_knowledge_graph_from_message(
+                                        msg["content"],
+                                        user_query,
+                                        msg.get("kg_cache_key"),
+                                    )
                                     if kg_data and len(kg_data.get("nodes", [])) > 0:
                                         # 确保当前消息有正确的kg_data
                                         st.session_state.messages[i]["kg_data"] = kg_data
@@ -443,7 +447,8 @@ def display_chat_interface():
                             message_obj = {
                                 "role": "assistant", 
                                 "content": answer,
-                                "message_id": str(uuid.uuid4())
+                                "message_id": str(uuid.uuid4()),
+                                "kg_cache_key": response.get("kg_cache_key"),
                             }
                             
                             # 如果有思考内容，添加到消息中
@@ -479,7 +484,11 @@ def display_chat_interface():
                             # 如果后端没有返回kg_data，尝试从回答中提取，并传递用户查询
                             if not kg_data or len(kg_data.get("nodes", [])) == 0:
                                 answer_content = message_obj["content"]
-                                kg_data = get_knowledge_graph_from_message(answer_content, prompt)
+                                kg_data = get_knowledge_graph_from_message(
+                                    answer_content,
+                                    prompt,
+                                    message_obj.get("kg_cache_key"),
+                                )
                             
                             if kg_data and len(kg_data.get("nodes", [])) > 0:
                                 # 更新该消息的kg_data

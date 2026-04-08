@@ -1,9 +1,12 @@
 from fastapi import APIRouter, HTTPException
 from typing import Optional
 import traceback
+from graphrag_agent.runtime_logging import emit_runtime_log
 from services.kg_service import (
     get_knowledge_graph, 
-    extract_kg_from_message, 
+    extract_kg_from_message,
+    get_cached_kg_data,
+    cache_kg_data_for_message,
     get_chunks,
     get_shortest_path,
     get_one_two_hop_paths,
@@ -15,7 +18,8 @@ from services.kg_service import (
 )
 from server_config.database import get_db_manager
 from models.schemas import (ReasoningRequest, EntityData, EntityDeleteData, EntitySearchFilter, EntityUpdateData,
-                            RelationData, RelationDeleteData, RelationSearchFilter, RelationUpdateData)
+                            RelationData, RelationDeleteData, RelationSearchFilter, RelationUpdateData,
+                            KnowledgeGraphFromMessageRequest)
 
 # 创建路由器
 router = APIRouter()
@@ -36,22 +40,71 @@ async def knowledge_graph(limit: int = 100, query: Optional[str] = None):
     return get_knowledge_graph(limit, query)
 
 
-@router.get("/knowledge_graph_from_message")
-async def knowledge_graph_from_message(message: Optional[str] = None, query: Optional[str] = None):
+@router.post("/knowledge_graph_from_message")
+async def knowledge_graph_from_message(request: KnowledgeGraphFromMessageRequest):
     """
-    从消息文本中提取知识图谱数据
+    从消息文本中提取知识图谱数据。
+
+    约定：
+    1. 如果提供 `kg_cache_key`，则只按缓存键读取，完全忽略 `message`
+    2. 仅当缺少 `kg_cache_key` 时，才回退到基于 `message` 的抽取逻辑
     
     Args:
-        message: 消息文本
-        query: 查询内容(可选)
+        request: 图谱提取请求体
         
     Returns:
         Dict: 知识图谱数据，包含节点和连接
     """
+    session_id = request.session_id
+    query = request.query
+    kg_cache_key = request.kg_cache_key
+    message = None if kg_cache_key else request.message
+    emit_runtime_log(
+        "kg.from_message.start",
+        session_id=session_id,
+        has_kg_cache_key=bool(kg_cache_key),
+        has_message=bool(message),
+        has_query=bool(query),
+    )
+
+    cached = get_cached_kg_data(
+        kg_cache_key=kg_cache_key,
+        session_id=session_id,
+        message=message,
+        query=query,
+    )
+    if cached is not None:
+        emit_runtime_log(
+            "kg.from_message.cache_hit",
+            session_id=session_id,
+            has_kg_cache_key=bool(kg_cache_key),
+            node_count=len(cached.get("nodes", [])),
+            link_count=len(cached.get("links", [])),
+        )
+        return cached
+
     if not message:
+        emit_runtime_log(
+            "kg.from_message.empty",
+            session_id=session_id,
+            has_kg_cache_key=bool(kg_cache_key),
+        )
         return {"nodes": [], "links": []}
-    
-    return extract_kg_from_message(message, query)
+
+    kg_data = extract_kg_from_message(message, query)
+    cache_kg_data_for_message(
+        session_id=session_id,
+        message=message,
+        query=query,
+        kg_data=kg_data,
+    )
+    emit_runtime_log(
+        "kg.from_message.generated",
+        session_id=session_id,
+        node_count=len(kg_data.get("nodes", [])),
+        link_count=len(kg_data.get("links", [])),
+    )
+    return kg_data
 
 @router.get("/chunks")
 async def chunks(limit: int = 10, offset: int = 0):

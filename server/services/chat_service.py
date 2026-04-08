@@ -5,10 +5,110 @@ from typing import Dict, List, AsyncGenerator
 from fastapi import HTTPException
 import json
 import asyncio
+from uuid import uuid4
 
 from services.agent_service import agent_manager
-from services.kg_service import extract_kg_from_message
+from services.kg_service import (
+    extract_kg_from_message,
+    cache_kg_data_for_message,
+)
 from utils.concurrent import chat_manager, feedback_manager
+from graphrag_agent.agents.fusion_agent import FUSION_EMPTY_ANSWER
+from graphrag_agent.runtime_logging import emit_runtime_log, shorten_text
+
+
+def _build_request_context(
+    request_id: str,
+    session_id: str,
+    agent_type: str,
+    *,
+    debug: bool,
+    stream: bool,
+    message: str,
+) -> Dict:
+    """构建统一的请求日志上下文。"""
+    return {
+        "request_id": request_id,
+        "session_id": session_id,
+        "agent_type": agent_type,
+        "debug": debug,
+        "stream": stream,
+        "query_preview": shorten_text(message),
+    }
+
+
+def _bind_agent_request_context(agent, context: Dict) -> None:
+    """向 Agent 注入请求级日志上下文。"""
+    if hasattr(agent, "set_request_context"):
+        agent.set_request_context(**context)
+
+
+def _clear_agent_request_context(agent) -> None:
+    """清理 Agent 上绑定的请求级日志上下文。"""
+    if hasattr(agent, "clear_request_context"):
+        agent.clear_request_context()
+
+
+def _emit_stage_timing(
+    request_context: Dict,
+    stage: str,
+    start_time: float,
+    **extra_fields,
+) -> float:
+    """输出单个阶段耗时日志并返回阶段耗时。"""
+    duration = time.time() - start_time
+    emit_runtime_log(
+        "chat.stage",
+        **request_context,
+        stage=stage,
+        duration=duration,
+        duration_ms=round(duration * 1000, 2),
+        **extra_fields,
+    )
+    return duration
+
+
+def _should_skip_answer_postprocess(answer: str, agent_type: str) -> bool:
+    """判断当前回答是否应跳过图谱提取和缓存等后处理。"""
+    normalized_answer = (answer or "").strip()
+    if not normalized_answer:
+        return True
+    if agent_type == "deep_research_agent":
+        return True
+    return normalized_answer == FUSION_EMPTY_ANSWER
+
+
+def _prepare_cached_kg_payload(
+    *,
+    answer: str,
+    query: str,
+    session_id: str,
+    agent_type: str,
+    debug: bool,
+) -> Dict:
+    """为回答提取并缓存知识图谱，供前端后续直接复用。"""
+    if _should_skip_answer_postprocess(answer, agent_type):
+        return {
+            "kg_data": {"nodes": [], "links": []},
+            "kg_cache_key": None,
+        }
+
+    try:
+        kg_data = extract_kg_from_message(answer, query)
+    except Exception:
+        traceback.print_exc()
+        kg_data = {"nodes": [], "links": []}
+
+    kg_cache_key = cache_kg_data_for_message(
+        session_id=session_id,
+        message=answer,
+        query=query,
+        kg_data=kg_data,
+    )
+    return {
+        "kg_data": kg_data if debug else None,
+        "kg_cache_key": kg_cache_key,
+    }
 
 
 async def process_chat(message: str, session_id: str, debug: bool = False, agent_type: str = "hybrid_agent", 
@@ -29,10 +129,22 @@ async def process_chat(message: str, session_id: str, debug: bool = False, agent
     """
     # 生成锁的键
     lock_key = f"{session_id}_chat"
+    request_id = uuid4().hex[:12]
+    request_context = _build_request_context(
+        request_id,
+        session_id,
+        agent_type,
+        debug=debug,
+        stream=False,
+        message=message,
+    )
+    request_start = time.time()
+    emit_runtime_log("chat.request.start", **request_context)
     
     # 非阻塞方式尝试获取锁
     lock_acquired = chat_manager.try_acquire_lock(lock_key)
     if not lock_acquired:
+        emit_runtime_log("chat.request.rejected", **request_context, reason="lock_busy")
         # 如果无法获取锁，说明有另一个请求正在处理
         raise HTTPException(
             status_code=429, 
@@ -45,10 +157,19 @@ async def process_chat(message: str, session_id: str, debug: bool = False, agent
         
         # 获取指定的agent
         try:
+            agent_select_start = time.time()
             selected_agent = agent_manager.get_agent(agent_type)
             if agent_type == "deep_research_agent":
                 selected_agent.is_deeper_tool(use_deeper_tool)
+            _bind_agent_request_context(selected_agent, request_context)
+            emit_runtime_log("chat.agent.selected", **request_context)
+            _emit_stage_timing(
+                request_context,
+                "agent_select",
+                agent_select_start,
+            )
         except ValueError as e:
+            emit_runtime_log("chat.request.invalid_agent", **request_context, error=str(e))
             raise HTTPException(status_code=400, detail=str(e))
         
         # 首先尝试快速路径 - 跳过完整处理
@@ -57,7 +178,13 @@ async def process_chat(message: str, session_id: str, debug: bool = False, agent
             fast_result = selected_agent.check_fast_cache(message, session_id)
             
             if fast_result:
-                print(f"API快速路径命中: {time.time() - start_fast:.4f}s")
+                fast_duration = time.time() - start_fast
+                emit_runtime_log(
+                    "chat.fast_cache.hit",
+                    **request_context,
+                    duration=fast_duration,
+                    duration_ms=round(fast_duration * 1000, 2),
+                )
                 
                 # 在调试模式下，需要提供额外信息
                 if debug:
@@ -72,22 +199,46 @@ async def process_chat(message: str, session_id: str, debug: bool = False, agent
                     # 尝试提取图谱数据，对deep_research_agent禁用
                     kg_data = {"nodes": [], "links": []}
                     if agent_type != "deep_research_agent":
-                        try:
-                            kg_data = extract_kg_from_message(fast_result)
-                        except:
-                            kg_data = {"nodes": [], "links": []}
+                        kg_payload = _prepare_cached_kg_payload(
+                            answer=fast_result,
+                            query=message,
+                            session_id=session_id,
+                            agent_type=agent_type,
+                            debug=debug,
+                        )
+                        kg_data = kg_payload["kg_data"] or {"nodes": [], "links": []}
+                        kg_cache_key = kg_payload["kg_cache_key"]
+                    else:
+                        kg_cache_key = None
                         
                     return {
                         "answer": fast_result,
                         "execution_log": mock_log,
-                        "kg_data": kg_data
+                        "kg_data": kg_data,
+                        "kg_cache_key": kg_cache_key,
                     }
                 else:
                     # 标准模式直接返回答案
-                    return {"answer": fast_result}
+                    kg_payload = _prepare_cached_kg_payload(
+                        answer=fast_result,
+                        query=message,
+                        session_id=session_id,
+                        agent_type=agent_type,
+                        debug=debug,
+                    )
+                    return {
+                        "answer": fast_result,
+                        "kg_cache_key": kg_payload["kg_cache_key"],
+                    }
+            emit_runtime_log(
+                "chat.fast_cache.miss",
+                **request_context,
+                duration=time.time() - start_fast,
+                duration_ms=round((time.time() - start_fast) * 1000, 2),
+            )
         except Exception as e:
             # 快速路径失败，继续常规流程
-            print(f"快速路径检查失败: {e}")
+            emit_runtime_log("chat.fast_cache.error", **request_context, error=str(e))
         
         # 检查是否为deep_research_agent且是否显示思考过程
         show_thinking = agent_type == "deep_research_agent"
@@ -96,7 +247,14 @@ async def process_chat(message: str, session_id: str, debug: bool = False, agent
             # 在Debug模式下使用ask_with_trace或ask_with_thinking，并返回知识图谱数据
             if agent_type == "deep_research_agent":
                 # 使用ask_with_thinking方法获取带思考过程的结果
+                answer_generation_start = time.time()
                 result = selected_agent.ask_with_thinking(message, thread_id=session_id)
+                _emit_stage_timing(
+                    request_context,
+                    "answer_generation",
+                    answer_generation_start,
+                    mode="debug_thinking",
+                )
                 
                 # 从结果字典中获取各个组件
                 thinking_process = result.get("thinking_process", "")
@@ -135,6 +293,7 @@ async def process_chat(message: str, session_id: str, debug: bool = False, agent
                     "answer": answer_content,
                     "execution_log": execution_log,
                     "kg_data": kg_data,
+                    "kg_cache_key": None,
                     "reference": reference,
                     "iterations": iterations,
                     "raw_thinking": thinking_process,
@@ -142,25 +301,53 @@ async def process_chat(message: str, session_id: str, debug: bool = False, agent
                 }
             else:
                 # 其他Agent使用标准的ask_with_trace
+                answer_generation_start = time.time()
                 result = selected_agent.ask_with_trace(
                     message, 
                     thread_id=session_id,
                 )
+                _emit_stage_timing(
+                    request_context,
+                    "answer_generation",
+                    answer_generation_start,
+                    mode="debug_trace",
+                )
                 
-                # 从结果中提取知识图谱数据
-                kg_data = extract_kg_from_message(result["answer"])
+                # 从结果中提取并缓存知识图谱数据
+                kg_postprocess_start = time.time()
+                kg_payload = _prepare_cached_kg_payload(
+                    answer=result["answer"],
+                    query=message,
+                    session_id=session_id,
+                    agent_type=agent_type,
+                    debug=debug,
+                )
+                _emit_stage_timing(
+                    request_context,
+                    "kg_postprocess",
+                    kg_postprocess_start,
+                    has_kg_cache_key=bool(kg_payload["kg_cache_key"]),
+                )
                 execution_log = result.get("execution_log", [])
                 
                 return {
                     "answer": result["answer"],
                     "execution_log": execution_log,
-                    "kg_data": kg_data,
+                    "kg_data": kg_payload["kg_data"],
+                    "kg_cache_key": kg_payload["kg_cache_key"],
                 }
         else:
             # 标准模式
             if agent_type == "deep_research_agent" and show_thinking:
                 # 使用ask_with_thinking方法获取带思考过程的结果
+                answer_generation_start = time.time()
                 result = selected_agent.ask_with_thinking(message, thread_id=session_id)
+                _emit_stage_timing(
+                    request_context,
+                    "answer_generation",
+                    answer_generation_start,
+                    mode="thinking",
+                )
                 
                 # 从结果字典中获取各个组件
                 thinking_process = result.get("thinking_process", "")
@@ -171,12 +358,14 @@ async def process_chat(message: str, session_id: str, debug: bool = False, agent
                 return {
                     "answer": answer_content,
                     "raw_thinking": thinking_process,
-                    "execution_logs": execution_logs
+                    "execution_logs": execution_logs,
+                    "kg_cache_key": None,
                 }
             else:
                 # 普通模式，使用标准ask方法
                 # 检查是否为DeepResearchAgent类型，只有DeepResearchAgent支持show_thinking参数
                 if agent_type == "deep_research_agent":
+                    answer_generation_start = time.time()
                     answer = selected_agent.ask(
                         message, 
                         thread_id=session_id,
@@ -184,16 +373,52 @@ async def process_chat(message: str, session_id: str, debug: bool = False, agent
                     )
                 else:
                     # 其他Agent类型不支持show_thinking参数
+                    answer_generation_start = time.time()
                     answer = selected_agent.ask(
                         message, 
                         thread_id=session_id
                     )
-                return {"answer": answer}
+                _emit_stage_timing(
+                    request_context,
+                    "answer_generation",
+                    answer_generation_start,
+                    mode="standard",
+                )
+                kg_postprocess_start = time.time()
+                kg_payload = _prepare_cached_kg_payload(
+                    answer=answer,
+                    query=message,
+                    session_id=session_id,
+                    agent_type=agent_type,
+                    debug=debug,
+                )
+                _emit_stage_timing(
+                    request_context,
+                    "kg_postprocess",
+                    kg_postprocess_start,
+                    has_kg_cache_key=bool(kg_payload["kg_cache_key"]),
+                )
+                return {
+                    "answer": answer,
+                    "kg_cache_key": kg_payload["kg_cache_key"],
+                }
     except Exception as e:
-        print(f"处理聊天请求时出错: {str(e)}")
-        traceback.print_exc()
+        emit_runtime_log(
+            "chat.request.error",
+            **request_context,
+            error=str(e),
+            traceback=traceback.format_exc(),
+        )
         raise HTTPException(status_code=500, detail=str(e))
     finally:
+        total_duration = time.time() - request_start
+        emit_runtime_log(
+            "chat.request.finish",
+            **request_context,
+            duration=total_duration,
+            duration_ms=round(total_duration * 1000, 2),
+        )
+        _clear_agent_request_context(locals().get("selected_agent"))
         # 释放锁
         chat_manager.release_lock(lock_key)
         
@@ -224,10 +449,22 @@ async def process_chat_stream(
     """
     # 生成锁的键
     lock_key = f"{session_id}_chat"
+    request_id = uuid4().hex[:12]
+    request_context = _build_request_context(
+        request_id,
+        session_id,
+        agent_type,
+        debug=debug,
+        stream=True,
+        message=message,
+    )
+    request_start = time.time()
+    emit_runtime_log("chat.stream.start", **request_context)
     
     # 非阻塞方式尝试获取锁
     lock_acquired = chat_manager.try_acquire_lock(lock_key)
     if not lock_acquired:
+        emit_runtime_log("chat.stream.rejected", **request_context, reason="lock_busy")
         # 返回错误流
         yield json.dumps({"status": "error", "message": "当前有其他请求正在处理，请稍后再试"})
         return
@@ -238,10 +475,19 @@ async def process_chat_stream(
         
         # 获取指定的agent
         try:
+            agent_select_start = time.time()
             selected_agent = agent_manager.get_agent(agent_type)
             if agent_type == "deep_research_agent":
                 selected_agent.is_deeper_tool(use_deeper_tool)
+            _bind_agent_request_context(selected_agent, request_context)
+            emit_runtime_log("chat.stream.agent_selected", **request_context)
+            _emit_stage_timing(
+                request_context,
+                "agent_select",
+                agent_select_start,
+            )
         except ValueError as e:
+            emit_runtime_log("chat.stream.invalid_agent", **request_context, error=str(e))
             yield json.dumps({"status": "error", "message": str(e)})
             return
         
@@ -251,7 +497,13 @@ async def process_chat_stream(
             fast_result = selected_agent.check_fast_cache(message, session_id)
             
             if fast_result:
-                print(f"API快速路径命中: {time.time() - start_fast:.4f}s")
+                fast_duration = time.time() - start_fast
+                emit_runtime_log(
+                    "chat.stream.fast_cache.hit",
+                    **request_context,
+                    duration=fast_duration,
+                    duration_ms=round(fast_duration * 1000, 2),
+                )
                 # 如果是调试模式，生成模拟执行日志
                 if debug:
                     mock_log = {
@@ -261,12 +513,30 @@ async def process_chat_stream(
                         "output": "高质量缓存命中，跳过完整处理"
                     }
                     yield {"execution_log": mock_log}
-                
+                kg_payload = _prepare_cached_kg_payload(
+                    answer=fast_result,
+                    query=message,
+                    session_id=session_id,
+                    agent_type=agent_type,
+                    debug=debug,
+                )
                 yield json.dumps({"status": "token", "content": fast_result})
+                if kg_payload["kg_cache_key"]:
+                    yield json.dumps({
+                        "status": "kg_cache_ready",
+                        "kg_cache_key": kg_payload["kg_cache_key"],
+                    })
                 yield json.dumps({"status": "done"})
                 return
+            fast_duration = time.time() - start_fast
+            emit_runtime_log(
+                "chat.stream.fast_cache.miss",
+                **request_context,
+                duration=fast_duration,
+                duration_ms=round(fast_duration * 1000, 2),
+            )
         except Exception as e:
-            print(f"快速路径检查失败: {e}")
+            emit_runtime_log("chat.stream.fast_cache.error", **request_context, error=str(e))
         
         # 保存执行轨迹（针对调试模式）
         execution_log = []
@@ -276,6 +546,9 @@ async def process_chat_stream(
             # 获取思考过程的流处理
             thinking_step = False
             thinking_content = ""
+            first_chunk_sent = False
+            answer_generation_start = time.time()
+            chunk_count = 0
             
             async for chunk in selected_agent.ask_stream(message, thread_id=session_id):
                 if isinstance(chunk, dict):
@@ -289,15 +562,40 @@ async def process_chat_stream(
                     # 这是思考步骤
                     thinking_step = True
                     thinking_content += chunk
+                    if not first_chunk_sent:
+                        emit_runtime_log(
+                            "chat.stream.first_chunk",
+                            **request_context,
+                            chunk_type="thinking",
+                            elapsed_from_request_ms=round((time.time() - request_start) * 1000, 2),
+                            elapsed_from_generation_ms=round((time.time() - answer_generation_start) * 1000, 2),
+                        )
+                        first_chunk_sent = True
                     yield json.dumps({"status": "thinking", "content": chunk})
                 else:
                     # 正常内容
                     if thinking_step:
                         thinking_step = False
                         yield json.dumps({"status": "answer_start"})
-                    
+                    if not first_chunk_sent:
+                        emit_runtime_log(
+                            "chat.stream.first_chunk",
+                            **request_context,
+                            chunk_type="answer",
+                            elapsed_from_request_ms=round((time.time() - request_start) * 1000, 2),
+                            elapsed_from_generation_ms=round((time.time() - answer_generation_start) * 1000, 2),
+                        )
+                        first_chunk_sent = True
+                    chunk_count += 1
                     yield json.dumps({"status": "token", "content": chunk})
             
+            _emit_stage_timing(
+                request_context,
+                "answer_generation",
+                answer_generation_start,
+                chunk_count=chunk_count,
+                mode="deep_research_stream",
+            )
             # 发送完成消息
             yield json.dumps({"status": "done", "thinking_content": thinking_content})
             
@@ -308,10 +606,17 @@ async def process_chat_stream(
             # 为调试模式收集执行轨迹
             if debug:
                 # 首先获取执行轨迹
+                answer_generation_start = time.time()
                 trace_result = await asyncio.to_thread(
                     selected_agent.ask_with_trace,
                     message,
                     thread_id=session_id
+                )
+                answer_generation_duration = _emit_stage_timing(
+                    request_context,
+                    "answer_generation",
+                    answer_generation_start,
+                    mode="debug_trace",
                 )
                 
                 # 发送执行轨迹
@@ -323,14 +628,94 @@ async def process_chat_stream(
                 # 发送答案，模拟流式输出
                 answer = trace_result["answer"]
                 chunk_size = 10  # 每个块的字符数
+                first_chunk_sent = False
+                chunk_count = 0
+                stream_emit_start = time.time()
                 for i in range(0, len(answer), chunk_size):
                     chunk = answer[i:i+chunk_size]
+                    if not first_chunk_sent:
+                        emit_runtime_log(
+                            "chat.stream.first_chunk",
+                            **request_context,
+                            chunk_type="answer",
+                            elapsed_from_request_ms=round((time.time() - request_start) * 1000, 2),
+                            elapsed_from_generation_ms=round(answer_generation_duration * 1000, 2),
+                        )
+                        first_chunk_sent = True
+                    chunk_count += 1
                     yield json.dumps({"status": "token", "content": chunk})
                     await asyncio.sleep(0.01)  # 小延迟模拟流式输出
+                _emit_stage_timing(
+                    request_context,
+                    "stream_emit",
+                    stream_emit_start,
+                    chunk_count=chunk_count,
+                )
+                kg_postprocess_start = time.time()
+                kg_payload = _prepare_cached_kg_payload(
+                    answer=answer,
+                    query=message,
+                    session_id=session_id,
+                    agent_type=agent_type,
+                    debug=debug,
+                )
+                _emit_stage_timing(
+                    request_context,
+                    "kg_postprocess",
+                    kg_postprocess_start,
+                    has_kg_cache_key=bool(kg_payload["kg_cache_key"]),
+                )
+                if kg_payload["kg_cache_key"]:
+                    yield json.dumps({
+                        "status": "kg_cache_ready",
+                        "kg_cache_key": kg_payload["kg_cache_key"],
+                    })
             else:
                 # 使用Agent的流式接口
+                answer_generation_start = time.time()
+                answer_chunks = []
+                first_chunk_sent = False
+                chunk_count = 0
                 async for chunk in selected_agent.ask_stream(message, thread_id=session_id):
+                    answer_chunks.append(chunk)
+                    if not first_chunk_sent:
+                        emit_runtime_log(
+                            "chat.stream.first_chunk",
+                            **request_context,
+                            chunk_type="answer",
+                            elapsed_from_request_ms=round((time.time() - request_start) * 1000, 2),
+                            elapsed_from_generation_ms=round((time.time() - answer_generation_start) * 1000, 2),
+                        )
+                        first_chunk_sent = True
+                    chunk_count += 1
                     yield json.dumps({"status": "token", "content": chunk})
+                answer = "".join(answer_chunks)
+                _emit_stage_timing(
+                    request_context,
+                    "answer_generation",
+                    answer_generation_start,
+                    chunk_count=chunk_count,
+                    mode="native_stream",
+                )
+                kg_postprocess_start = time.time()
+                kg_payload = _prepare_cached_kg_payload(
+                    answer=answer,
+                    query=message,
+                    session_id=session_id,
+                    agent_type=agent_type,
+                    debug=debug,
+                )
+                _emit_stage_timing(
+                    request_context,
+                    "kg_postprocess",
+                    kg_postprocess_start,
+                    has_kg_cache_key=bool(kg_payload["kg_cache_key"]),
+                )
+                if kg_payload["kg_cache_key"]:
+                    yield json.dumps({
+                        "status": "kg_cache_ready",
+                        "kg_cache_key": kg_payload["kg_cache_key"],
+                    })
             
             # 发送完成消息
             yield json.dumps({"status": "done"})
@@ -338,10 +723,17 @@ async def process_chat_stream(
             # 对于不支持流式处理的Agent，回退到非流式处理并模拟流
             if debug:
                 # 首先获取执行轨迹
+                answer_generation_start = time.time()
                 trace_result = await asyncio.to_thread(
                     selected_agent.ask_with_trace,
                     message,
                     thread_id=session_id
+                )
+                answer_generation_duration = _emit_stage_timing(
+                    request_context,
+                    "answer_generation",
+                    answer_generation_start,
+                    mode="fallback_debug_trace",
                 )
                 
                 # 发送执行轨迹
@@ -353,29 +745,124 @@ async def process_chat_stream(
                 # 发送答案，模拟流式输出
                 answer = trace_result["answer"]
                 chunk_size = 10  # 每个块的字符数
+                first_chunk_sent = False
+                chunk_count = 0
+                stream_emit_start = time.time()
                 for i in range(0, len(answer), chunk_size):
                     chunk = answer[i:i+chunk_size]
+                    if not first_chunk_sent:
+                        emit_runtime_log(
+                            "chat.stream.first_chunk",
+                            **request_context,
+                            chunk_type="answer",
+                            elapsed_from_request_ms=round((time.time() - request_start) * 1000, 2),
+                            elapsed_from_generation_ms=round(answer_generation_duration * 1000, 2),
+                        )
+                        first_chunk_sent = True
+                    chunk_count += 1
                     yield json.dumps({"status": "token", "content": chunk})
                     await asyncio.sleep(0.01)  # 小延迟模拟流式输出
+                _emit_stage_timing(
+                    request_context,
+                    "stream_emit",
+                    stream_emit_start,
+                    chunk_count=chunk_count,
+                )
+                kg_postprocess_start = time.time()
+                kg_payload = _prepare_cached_kg_payload(
+                    answer=answer,
+                    query=message,
+                    session_id=session_id,
+                    agent_type=agent_type,
+                    debug=debug,
+                )
+                _emit_stage_timing(
+                    request_context,
+                    "kg_postprocess",
+                    kg_postprocess_start,
+                    has_kg_cache_key=bool(kg_payload["kg_cache_key"]),
+                )
+                if kg_payload["kg_cache_key"]:
+                    yield json.dumps({
+                        "status": "kg_cache_ready",
+                        "kg_cache_key": kg_payload["kg_cache_key"],
+                    })
             else:
                 # 非调试模式，简单获取答案
+                answer_generation_start = time.time()
                 answer = selected_agent.ask(message, thread_id=session_id)
+                answer_generation_duration = _emit_stage_timing(
+                    request_context,
+                    "answer_generation",
+                    answer_generation_start,
+                    mode="fallback_standard",
+                )
                 
                 # 分块发送响应以模拟流式输出
                 chunk_size = 10  # 每个块的字符数
+                first_chunk_sent = False
+                chunk_count = 0
+                stream_emit_start = time.time()
                 for i in range(0, len(answer), chunk_size):
                     chunk = answer[i:i+chunk_size]
+                    if not first_chunk_sent:
+                        emit_runtime_log(
+                            "chat.stream.first_chunk",
+                            **request_context,
+                            chunk_type="answer",
+                            elapsed_from_request_ms=round((time.time() - request_start) * 1000, 2),
+                            elapsed_from_generation_ms=round(answer_generation_duration * 1000, 2),
+                        )
+                        first_chunk_sent = True
+                    chunk_count += 1
                     yield json.dumps({"status": "token", "content": chunk})
                     await asyncio.sleep(0.01)  # 小延迟模拟流式输出
+                _emit_stage_timing(
+                    request_context,
+                    "stream_emit",
+                    stream_emit_start,
+                    chunk_count=chunk_count,
+                )
+                kg_postprocess_start = time.time()
+                kg_payload = _prepare_cached_kg_payload(
+                    answer=answer,
+                    query=message,
+                    session_id=session_id,
+                    agent_type=agent_type,
+                    debug=debug,
+                )
+                _emit_stage_timing(
+                    request_context,
+                    "kg_postprocess",
+                    kg_postprocess_start,
+                    has_kg_cache_key=bool(kg_payload["kg_cache_key"]),
+                )
+                if kg_payload["kg_cache_key"]:
+                    yield json.dumps({
+                        "status": "kg_cache_ready",
+                        "kg_cache_key": kg_payload["kg_cache_key"],
+                    })
             
             # 发送完成消息
             yield json.dumps({"status": "done"})
             
     except Exception as e:
-        print(f"处理聊天请求时出错: {str(e)}")
-        print(traceback.format_exc())
+        emit_runtime_log(
+            "chat.stream.error",
+            **request_context,
+            error=str(e),
+            traceback=traceback.format_exc(),
+        )
         yield json.dumps({"status": "error", "message": str(e)})
     finally:
+        total_duration = time.time() - request_start
+        emit_runtime_log(
+            "chat.stream.finish",
+            **request_context,
+            duration=total_duration,
+            duration_ms=round(total_duration * 1000, 2),
+        )
+        _clear_agent_request_context(locals().get("selected_agent"))
         # 释放锁
         chat_manager.release_lock(lock_key)
         

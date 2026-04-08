@@ -4,8 +4,12 @@ import time
 from typing import Any, AsyncGenerator, Dict, Optional, Tuple
 
 from graphrag_agent.config.settings import AGENT_SETTINGS
+from graphrag_agent.runtime_logging import emit_runtime_log, shorten_text
 
 from graphrag_agent.agents.multi_agent.integration.legacy_facade import MultiAgentFacade
+
+
+FUSION_EMPTY_ANSWER = "未能生成回答"
 
 
 class _MemoryShim:
@@ -36,6 +40,23 @@ class FusionGraphRAGAgent:
         self._last_payload: Dict[str, Any] = {}
         self._flush_threshold = AGENT_SETTINGS["fusion_stream_flush_threshold"]
         self._default_recursion_limit = AGENT_SETTINGS["default_recursion_limit"]
+        self._request_context: Dict[str, Any] = {}
+
+    def set_request_context(self, **context: Any) -> None:
+        """设置当前请求的日志上下文。"""
+        self._request_context = {
+            "agent_class": self.__class__.__name__,
+            **context,
+        }
+
+    def clear_request_context(self) -> None:
+        """清理当前请求的日志上下文。"""
+        self._request_context = {}
+
+    def _log_runtime_event(self, event: str, **fields: Any) -> None:
+        """输出统一格式的 Fusion Agent 运行时日志。"""
+        payload = {**self._request_context, **fields}
+        emit_runtime_log(event, **payload)
 
     def ask(self, query: str, thread_id: str = "default", recursion_limit: Optional[int] = None) -> str:
         return self._execute(query, thread_id)[0]
@@ -52,7 +73,17 @@ class FusionGraphRAGAgent:
 
     def check_fast_cache(self, query: str, thread_id: str = "default") -> Optional[str]:
         """检查 Fusion Agent 的内存缓存，兼容现有服务层快速路径。"""
-        return self._read_cache(query, thread_id)
+        start_time = time.time()
+        result = self._read_cache(query, thread_id)
+        duration = time.time() - start_time
+        self._log_runtime_event(
+            "agent.performance",
+            operation="fast_cache_check",
+            duration=duration,
+            duration_ms=round(duration * 1000, 2),
+            hit=result is not None,
+        )
+        return result
 
     async def ask_stream(self, query: str, thread_id: str = "default", recursion_limit: Optional[int] = None) -> AsyncGenerator[str, None]:
         cached = self._read_cache(query, thread_id)
@@ -66,14 +97,34 @@ class FusionGraphRAGAgent:
         self._session_cache.clear()
 
     def _execute(self, query: str, thread_id: str, *, assumptions: Optional[list[str]] = None, report_type: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
+        self._log_runtime_event(
+            "fusion.execute.start",
+            thread_id=thread_id,
+            query_preview=shorten_text(query)
+        )
         cached = self._read_cache(query, thread_id)
         if cached is not None:
+            self._log_runtime_event(
+                "fusion.execute.cache_hit",
+                thread_id=thread_id
+            )
             return cached, {"status": "cached", "execution_records": []}
+        start_time = time.time()
         payload = self.multi_agent.process_query(query.strip(), assumptions=assumptions, report_type=report_type)
         answer = self._normalize_answer(payload.get("response"))
-        self._write_cache(query, thread_id, answer)
+        # 失败兜底答案不进入缓存，避免快速路径持续放大同一错误。
+        if answer != FUSION_EMPTY_ANSWER:
+            self._write_cache(query, thread_id, answer)
         self.execution_log = self._build_execution_log(payload, query)
         self._last_payload = payload
+        duration = time.time() - start_time
+        self._log_runtime_event(
+            "fusion.execute.success",
+            thread_id=thread_id,
+            duration=duration,
+            duration_ms=round(duration * 1000, 2),
+            execution_record_count=len(payload.get("execution_records", [])),
+        )
         return answer, payload
 
     def _read_cache(self, query: str, thread_id: str) -> Optional[str]:
@@ -89,7 +140,7 @@ class FusionGraphRAGAgent:
     def _normalize_answer(answer: Any) -> str:
         if isinstance(answer, str) and answer.strip():
             return answer.strip()
-        return "未能生成回答" if answer is None else str(answer)
+        return FUSION_EMPTY_ANSWER if answer is None else str(answer)
 
     @staticmethod
     def _build_execution_log(payload: Dict[str, Any], query: str) -> list[Dict[str, Any]]:

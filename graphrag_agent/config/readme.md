@@ -6,6 +6,7 @@ graphrag_agent/config/    # 配置文件目录
 ├── __init__.py           # 包初始化文件（空文件）
 ├── neo4jdb.py            # Neo4j数据库连接管理
 ├── prompts/              # 提示模板集合
+├── taxonomy.py           # 工程热力学知识图谱分类标准
 └── settings.py           # 全局配置参数与环境变量管理
 ```
 
@@ -349,44 +350,34 @@ DISAMBIG_NIL_THRESHOLD=0.65
 
 ### 2. 知识图谱Schema配置
 
-**修改实体和关系类型**（在`settings.py`中）：
+当前项目以 `taxonomy.py` 为权威分类来源，`settings.py` 只负责导出和装配。
+
+**工程热力学实体与关系标准**：
 ```python
 entity_types = [
-    "章节",
-    "小节",
-    "图表",
-    "案例",
-    "概念",
-    "原理定律",
-    "物理量",
-    "公式",
-    "变量",
-    "条件",
-    "过程",
-    "状态",
-    "系统对象",
-    "组成部件",
-    "材料介质",
-    "其它",
+    "Concept",
+    "Law",
+    "Theorem",
+    "Quantity",
+    "Process",
+    "Cycle",
+    "Equipment",
+    "Formula",
+    "Condition",
+    "Other",
 ]
 
 relationship_types = [
-    "包含",
-    "属于",
-    "定义",
-    "遵循",
-    "表示",
-    "使用变量",
-    "单位为",
-    "适用条件",
-    "导致",
-    "影响",
-    "依赖",
-    "具有状态",
-    "图示说明",
-    "实例说明",
-    "对比",
-    "其它",
+    "IS_A",
+    "DEFINES",
+    "CONSISTS_OF",
+    "DEPENDS_ON",
+    "DERIVES_FROM",
+    "ASSUMES",
+    "VALID_UNDER",
+    "APPLIES_TO",
+    "USES",
+    "RELATED_TO",
 ]
 ```
 

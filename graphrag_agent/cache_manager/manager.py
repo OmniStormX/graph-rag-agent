@@ -98,6 +98,31 @@ class CacheManager:
             'misses': 0,
             'total_queries': 0
         }
+
+    def _load_exact_cache_item(self, key: str) -> Optional[CacheItem]:
+        """按缓存键直接读取缓存项，不触发语义匹配。"""
+        cached_data = self.storage.get(key)
+        if cached_data is None:
+            return None
+
+        cache_item = CacheItem.from_any(cached_data)
+        cache_item.update_access_stats()
+        return cache_item
+
+    def _resolve_cache_content(
+        self,
+        cache_item: Optional[CacheItem],
+        *,
+        high_quality_only: bool = False
+    ) -> Optional[Any]:
+        """根据质量要求解析缓存内容。"""
+        if cache_item is None:
+            return None
+
+        if high_quality_only and not cache_item.is_high_quality():
+            return None
+
+        return cache_item.get_content()
     
     def _create_storage_backend(self, storage_backend, memory_only, cache_dir, 
                               max_memory_size, max_disk_size) -> CacheStorageBackend:
@@ -130,100 +155,93 @@ class CacheManager:
         """获取缓存内容，支持精确匹配和向量相似性匹配"""
         start_time = time.time()
         self.performance_metrics['total_queries'] += 1
-        
-        # 生成缓存键
-        key = self._get_consistent_key(query, **kwargs)
-        
-        # 首先尝试精确匹配
-        cached_data = self.storage.get(key)
-        if cached_data is not None:
+
+        exact_result = self.get_exact(query, **kwargs)
+        if exact_result is not None:
             self.performance_metrics['exact_hits'] += 1
-            cache_item = CacheItem.from_any(cached_data)
-            cache_item.update_access_stats()
-            
-            # 验证逻辑
-            if skip_validation or cache_item.is_high_quality():
-                content = cache_item.get_content()
-                self.performance_metrics["get_time"] = time.time() - start_time
-                return content
-            
-            content = cache_item.get_content()
             self.performance_metrics["get_time"] = time.time() - start_time
-            return content
-        
-        # 如果精确匹配失败且启用了向量相似性，尝试向量匹配
-        if self.enable_vector_similarity and self.vector_matcher:
-            context_info = self._extract_context_info(**kwargs)
-            similar_keys = self.vector_matcher.find_similar(query, context_info, top_k=3)
-            
-            for similar_key, similarity_score in similar_keys:
-                cached_data = self.storage.get(similar_key)
-                if cached_data is not None:
-                    self.performance_metrics['vector_hits'] += 1
-                    cache_item = CacheItem.from_any(cached_data)
-                    cache_item.update_access_stats()
-                    
-                    # 添加相似性信息到元数据
-                    cache_item.metadata['similarity_score'] = similarity_score
-                    cache_item.metadata['original_query'] = query
-                    cache_item.metadata['matched_via_vector'] = True
-                    
-                    if skip_validation or cache_item.is_high_quality():
-                        content = cache_item.get_content()
-                        self.performance_metrics["get_time"] = time.time() - start_time
-                        return content
-                    
-                    content = cache_item.get_content()
-                    self.performance_metrics["get_time"] = time.time() - start_time
-                    return content
-        
-        # 未找到匹配的缓存
+            return exact_result
+
+        semantic_result = self.get_semantic(query, top_k=3, **kwargs)
+        if semantic_result is not None:
+            self.performance_metrics['vector_hits'] += 1
+            self.performance_metrics["get_time"] = time.time() - start_time
+            return semantic_result
+
         self.performance_metrics['misses'] += 1
         self.performance_metrics["get_time"] = time.time() - start_time
         return None
-    
+
+    def get_exact(
+        self,
+        query: str,
+        *,
+        high_quality_only: bool = False,
+        **kwargs
+    ) -> Optional[Any]:
+        """仅执行精确缓存匹配，不触发语义检索。"""
+        start_time = time.time()
+        key = self._get_consistent_key(query, **kwargs)
+        cache_item = self._load_exact_cache_item(key)
+        content = self._resolve_cache_content(
+            cache_item,
+            high_quality_only=high_quality_only
+        )
+        self.performance_metrics["exact_get_time"] = time.time() - start_time
+        return content
+
+    def get_semantic(
+        self,
+        query: str,
+        *,
+        high_quality_only: bool = False,
+        top_k: int = 3,
+        **kwargs
+    ) -> Optional[Any]:
+        """仅执行语义缓存匹配，适合作为慢路径兜底。"""
+        start_time = time.time()
+        if not (self.enable_vector_similarity and self.vector_matcher):
+            self.performance_metrics["semantic_get_time"] = time.time() - start_time
+            return None
+
+        context_info = self._extract_context_info(**kwargs)
+        similar_keys = self.vector_matcher.find_similar(query, context_info, top_k=top_k)
+
+        for similar_key, similarity_score in similar_keys:
+            cache_item = self._load_exact_cache_item(similar_key)
+            if cache_item is None:
+                continue
+
+            # 为上层保留命中来源信息，便于后续排障与可观测性分析。
+            cache_item.metadata['similarity_score'] = similarity_score
+            cache_item.metadata['original_query'] = query
+            cache_item.metadata['matched_via_vector'] = True
+
+            content = self._resolve_cache_content(
+                cache_item,
+                high_quality_only=high_quality_only
+            )
+            if content is not None:
+                self.performance_metrics["semantic_get_time"] = time.time() - start_time
+                return content
+
+        self.performance_metrics["semantic_get_time"] = time.time() - start_time
+        return None
+
     def get_fast(self, query: str, **kwargs) -> Optional[Any]:
         """快速获取高质量缓存内容"""
         start_time = time.time()
-        
-        # 生成缓存键
-        key = self._get_consistent_key(query, **kwargs)
-        
-        # 获取缓存项
-        cached_data = self.storage.get(key)
-        if cached_data is not None:
-            cache_item = CacheItem.from_any(cached_data)
-            
-            # 只返回高质量缓存
-            if cache_item.is_high_quality():
-                cache_item.update_access_stats()
-                
-                # 更新上下文历史
-                self._update_strategy_history(query, **kwargs)
-                
-                content = cache_item.get_content()
-                self.performance_metrics["fast_get_time"] = time.time() - start_time
-                return content
-        
-        # 尝试向量相似性匹配高质量缓存
-        if self.enable_vector_similarity and self.vector_matcher:
-            context_info = self._extract_context_info(**kwargs)
-            similar_keys = self.vector_matcher.find_similar(query, context_info, top_k=1)
-            
-            for similar_key, similarity_score in similar_keys:
-                cached_data = self.storage.get(similar_key)
-                if cached_data is not None:
-                    cache_item = CacheItem.from_any(cached_data)
-                    
-                    if cache_item.is_high_quality():
-                        cache_item.update_access_stats()
-                        cache_item.metadata['similarity_score'] = similarity_score
-                        cache_item.metadata['matched_via_vector'] = True
-                        
-                        content = cache_item.get_content()
-                        self.performance_metrics["fast_get_time"] = time.time() - start_time
-                        return content
-        
+
+        exact_result = self.get_exact(query, high_quality_only=True, **kwargs)
+        if exact_result is not None:
+            self.performance_metrics["fast_get_time"] = time.time() - start_time
+            return exact_result
+
+        semantic_result = self.get_semantic(query, high_quality_only=True, top_k=1, **kwargs)
+        if semantic_result is not None:
+            self.performance_metrics["fast_get_time"] = time.time() - start_time
+            return semantic_result
+
         self.performance_metrics["fast_get_time"] = time.time() - start_time
         return None
     

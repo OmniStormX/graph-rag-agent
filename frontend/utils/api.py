@@ -283,25 +283,46 @@ def get_knowledge_graph(limit: int = 100, query: str = None) -> Dict:
         st.error(f"获取知识图谱时出错: {str(e)}")
         return {"nodes": [], "links": []}
 
-def get_knowledge_graph_from_message(message: str, query: str = None):
-    """从AI响应中提取知识图谱数据"""
-    # 生成缓存键 - 使用消息哈希和查询组合
-    import hashlib
-    message_hash = hashlib.md5(message.encode()).hexdigest()
-    cache_key = f"kg_msg:{message_hash}:query={query}"
+def get_knowledge_graph_from_message(
+    message: str = None,
+    query: str = None,
+    kg_cache_key: str = None,
+):
+    """根据缓存键或回答文本获取知识图谱数据。"""
+    # 优先使用后端返回的缓存键，避免将完整回答拼接进 URL 和日志。
+    if kg_cache_key:
+        cache_key = (
+            f"kg_msg:{st.session_state.session_id}:"
+            f"kg_key={kg_cache_key}:query={query}"
+        )
+    else:
+        # 兼容旧逻辑：当没有缓存键时，仍可基于回答文本回退提取。
+        import hashlib
+        message_hash = hashlib.md5((message or "").encode()).hexdigest()
+        cache_key = (
+            f"kg_msg:{st.session_state.session_id}:{message_hash}:"
+            f"query={query}:kg_key={kg_cache_key}"
+        )
     
     # 检查缓存
     if cache_key in st.session_state.cache.get('knowledge_graphs', {}):
         return st.session_state.cache['knowledge_graphs'][cache_key]
     
     try:
-        params = {"message": message}
+        payload = {
+            "session_id": st.session_state.session_id,
+        }
         if query:
-            params["query"] = query
+            payload["query"] = query
+        if kg_cache_key:
+            payload["kg_cache_key"] = kg_cache_key
+        elif message:
+            # 仅在没有缓存键时才上传完整回答，作为兜底兼容路径。
+            payload["message"] = message
             
-        response = requests.get(
+        response = requests.post(
             f"{API_URL}/knowledge_graph_from_message",
-            params=params,
+            json=payload,
             timeout=30
         )
         result = response.json()

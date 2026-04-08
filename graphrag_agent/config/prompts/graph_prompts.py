@@ -5,27 +5,28 @@
 """
 
 system_template_build_graph = """
--目标- 
-给定教材、讲义或技术文档文本以及实体类型列表，从文本中识别出这些类型的所有实体以及所识别实体之间的所有关系。 
+-目标-
+给定工程热力学相关文本以及实体类型列表，从文本中识别出这些类型的所有实体以及所识别实体之间的所有关系。
 -步骤- 
 1.识别所有实体。对于每个已识别的实体，提取以下信息： 
 -entity_name：实体名称，大写 
 -entity_type：以下类型之一：[{entity_types}]
--entity_description：对实体的定义、组成、性质、功能、适用范围、参数含义或知识作用的综合描述 
+-entity_description：对实体的定义、组成、性质、功能、适用范围、参数含义或知识作用的综合描述
 将每个实体格式化为("entity"{tuple_delimiter}<entity_name>{tuple_delimiter}<entity_type>{tuple_delimiter}<entity_description>
 2.从步骤1中识别的实体中，识别彼此*明显相关*的所有实体配对(source_entity, target_entity)。 
 对于每对相关实体，提取以下信息： 
 -source_entity：源实体的名称，如步骤1中所标识的 
 -target_entity：目标实体的名称，如步骤1中所标识的
--relationship_type：以下类型之一：[{relationship_types}]，当不能归类为上述列表中前面的类型时，归类为最后的一类“其它”
--relationship_description：解释源实体和目标实体在定义、组成、层级、变量表达、适用条件、因果机理、过程链路或对比分析上的关联原因，优先描述“包含、定义、表示、适用条件、导致、影响、依赖、对比”等强语义关系 
+-relationship_type：以下类型之一：[{relationship_types}]，当不能归类为上述列表中前面的类型时，归类为最后的一类“RELATED_TO”
+-relationship_description：解释源实体和目标实体在定义、组成、分类、适用条件、推导来源、应用对象、依赖条件或使用方式上的关联原因，优先描述“IS_A、DEFINES、CONSISTS_OF、DEPENDS_ON、DERIVES_FROM、VALID_UNDER、APPLIES_TO、USES”等强语义关系
 -relationship_strength：一个数字评分，表示源实体和目标实体之间关系的强度 
 将每个关系格式化为("relationship"{tuple_delimiter}<source_entity>{tuple_delimiter}<target_entity>{tuple_delimiter}<relationship_type>{tuple_delimiter}<relationship_description>{tuple_delimiter}<relationship_strength>) 
 3.实体和关系的所有属性用中文输出，步骤1和2中识别的所有实体和关系输出为一个列表。使用**{record_delimiter}**作为列表分隔符。 
 4.完成后，输出{completion_delimiter}
 5.尽量抽取具有知识组织意义的关系，不要把泛泛的叙事性关联、弱语义共现或仅相邻出现的词汇误判为有效关系。
-6.如果文本中出现章节层级、定义句、公式、变量、单位、适用条件、过程步骤、系统组成、图示说明或案例分析，应优先围绕这些内容建立关系。
-7.章节、小节、图表、案例等文档结构实体只在文本中明确出现时提取，不要为了凑 schema 强行补全。
+6.如果文本中出现定律、公式、物理量、循环、设备、假设条件、适用边界或推导过程，应优先围绕这些内容建立关系。
+7.实体标签应优先贴合工程热力学主标签体系：Concept、Law、Theorem、Quantity、Process、Cycle、Equipment、Formula、Condition。
+8.不要为了凑 schema 强行补全实体；当文本证据不足时宁可少抽，也不要制造伪关系。
 
 ###################### 
 -示例- 
@@ -167,3 +168,4 @@ __all__ = [
     "COMMUNITY_SUMMARY_PROMPT",
     "entity_alignment_prompt",
 ]
+

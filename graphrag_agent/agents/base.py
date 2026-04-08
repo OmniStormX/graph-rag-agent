@@ -10,6 +10,7 @@ import time
 import asyncio
 
 from graphrag_agent.models.get_models import get_llm_model, get_stream_llm_model, get_embeddings_model
+from graphrag_agent.runtime_logging import emit_runtime_log, shorten_text
 from graphrag_agent.cache_manager.manager import (
     CacheManager, 
     ContextAwareCacheKeyStrategy, 
@@ -68,6 +69,7 @@ class BaseAgent(ABC):
         self.performance_metrics = {}  # 性能指标收集
         # 关键词缓存与回答缓存隔离，避免结构化字典误入回答缓存链路。
         self._keyword_cache: Dict[str, Dict[str, List[str]]] = {}
+        self._request_context: Dict[str, Any] = {}
         
         # 初始化工具
         self.tools = self._setup_tools()
@@ -183,6 +185,22 @@ class BaseAgent(ABC):
             "input": input_data,
             "output": output_data
         })
+
+    def set_request_context(self, **context: Any) -> None:
+        """设置当前请求的日志上下文。"""
+        self._request_context = {
+            "agent_class": self.__class__.__name__,
+            **context,
+        }
+
+    def clear_request_context(self) -> None:
+        """清理当前请求的日志上下文。"""
+        self._request_context = {}
+
+    def _log_runtime_event(self, event: str, **fields: Any) -> None:
+        """打印带请求上下文的结构化运行时日志。"""
+        payload = {**self._request_context, **fields}
+        emit_runtime_log(event, **payload)
     
     def _log_performance(self, operation, metrics):
         """记录性能指标"""
@@ -190,10 +208,16 @@ class BaseAgent(ABC):
             "timestamp": time.time(),
             **metrics
         }
-        
-        # 输出关键性能指标
-        if "duration" in metrics:
-            print(f"性能指标 - {operation}: {metrics['duration']:.4f}s")
+
+        log_fields = dict(metrics)
+        if "duration" in log_fields:
+            log_fields["duration_ms"] = round(log_fields["duration"] * 1000, 2)
+
+        self._log_runtime_event(
+            "agent.performance",
+            operation=operation,
+            **log_fields
+        )
     
     def _agent_node(self, state):
         """Agent 节点逻辑"""
@@ -274,19 +298,15 @@ class BaseAgent(ABC):
         return await asyncio.get_event_loop().run_in_executor(None, sync_generate)
     
     def check_fast_cache(self, query: str, thread_id: str = "default") -> str:
-        """专用的快速缓存检查方法，用于高性能路径"""
+        """专用的快速缓存检查方法，仅执行精确高质量缓存命中。"""
         start_time = time.time()
-        
-        # 提取关键词，确保在缓存键中使用
-        keywords = self._extract_keywords(query)
-        cache_params = {
-            "thread_id": thread_id,
-            "low_level_keywords": keywords.get("low_level", []),
-            "high_level_keywords": keywords.get("high_level", [])
-        }
-        
-        # 使用缓存管理器的快速获取方法，传递相关参数
-        result = self.cache_manager.get_fast(query, **cache_params)
+
+        # 快速路径必须避免触发 LLM 和语义检索，只做会话内精确缓存命中。
+        result = self.cache_manager.get_exact(
+            query,
+            high_quality_only=True,
+            thread_id=thread_id
+        )
         duration = time.time() - start_time
         self._log_performance("fast_cache_check", {
             "duration": duration,
@@ -294,63 +314,134 @@ class BaseAgent(ABC):
         })
         
         return result if self._is_valid_text_response(result) else None
-    
-    def _check_all_caches(self, query: str, thread_id: str = "default"):
-        """整合的缓存检查方法"""
+
+    def _build_keyword_cache_params(self, query: str, thread_id: str = "default") -> Dict[str, Any]:
+        """构建语义缓存所需的关键词参数。"""
+        keywords = self._extract_keywords(query)
+        return {
+            "thread_id": thread_id,
+            "low_level_keywords": keywords.get("low_level", []),
+            "high_level_keywords": keywords.get("high_level", [])
+        }
+
+    def check_semantic_cache(
+        self,
+        query: str,
+        thread_id: str = "default",
+        *,
+        high_quality_only: bool = True
+    ) -> str:
+        """执行语义缓存检查，作为精确缓存失配后的慢路径兜底。"""
+        start_time = time.time()
+
+        keyword_start = time.time()
+        cache_params = self._build_keyword_cache_params(query, thread_id)
+        keyword_duration = time.time() - keyword_start
+
+        semantic_lookup_start = time.time()
+        result = self.cache_manager.get_semantic(
+            query,
+            high_quality_only=high_quality_only,
+            top_k=1 if high_quality_only else 3,
+            **cache_params
+        )
+        semantic_lookup_duration = time.time() - semantic_lookup_start
+
+        duration = time.time() - start_time
+        self._log_performance("semantic_cache_check", {
+            "duration": duration,
+            "keyword_duration": keyword_duration,
+            "semantic_lookup_duration": semantic_lookup_duration,
+            "high_quality_only": high_quality_only,
+            "hit": result is not None
+        })
+
+        return result if self._is_valid_text_response(result) else None
+
+    def _lookup_cached_response(self, query: str, thread_id: str = "default"):
+        """统一缓存决策逻辑，返回命中内容、命中类型与总耗时。"""
         cache_check_start = time.time()
-        
-        # 1. 首先尝试全局缓存（跨会话缓存）
-        global_result = self.global_cache_manager.get(query)
+
+        # 1. 全局缓存仅做精确匹配，避免在共享缓存上触发昂贵的语义检索。
+        global_result = self.global_cache_manager.get_exact(query)
         if self._is_valid_text_response(global_result):
-            print(f"全局缓存命中: {query[:30]}...")
-            
             cache_time = time.time() - cache_check_start
             self._log_performance("cache_check", {
                 "duration": cache_time,
-                "type": "global"
+                "type": "global_exact"
             })
-            
-            return global_result
-        
-        # 2. 尝试快速路径 - 跳过验证的高质量缓存
+            return global_result, "global_exact", cache_time
+
+        # 2. 会话快速路径只允许精确高质量命中，保证 fast path 可预测。
         fast_result = self.check_fast_cache(query, thread_id)
         if self._is_valid_text_response(fast_result):
-            print(f"快速路径缓存命中: {query[:30]}...")
-            
-            # 将命中的内容同步到全局缓存
             self.global_cache_manager.set(query, fast_result)
-            
             cache_time = time.time() - cache_check_start
             self._log_performance("cache_check", {
                 "duration": cache_time,
-                "type": "fast"
+                "type": "fast_exact"
             })
-            
-            return fast_result
-        
-        # 3. 尝试常规缓存路径，但优化验证
-        cached_response = self.cache_manager.get(query, skip_validation=True, thread_id=thread_id)
-        if self._is_valid_text_response(cached_response):
-            print(f"常规缓存命中，跳过验证: {query[:30]}...")
-            
-            # 将命中的内容同步到全局缓存
-            self.global_cache_manager.set(query, cached_response)
-            
+            return fast_result, "fast_exact", cache_time
+
+        # 3. 语义缓存单独作为慢路径阶段，便于独立观测与熔断。
+        semantic_result = self.check_semantic_cache(
+            query,
+            thread_id,
+            high_quality_only=True
+        )
+        if self._is_valid_text_response(semantic_result):
+            self.global_cache_manager.set(query, semantic_result)
             cache_time = time.time() - cache_check_start
             self._log_performance("cache_check", {
                 "duration": cache_time,
-                "type": "standard"
+                "type": "semantic_high_quality"
             })
-            
-            return cached_response
-        
-        # 没有命中任何缓存
+            return semantic_result, "semantic_high_quality", cache_time
+
+        # 4. 精确缓存兜底，允许返回未标记高质量但仍可用的会话缓存。
+        exact_result = self.cache_manager.get_exact(query, thread_id=thread_id)
+        if self._is_valid_text_response(exact_result):
+            self.global_cache_manager.set(query, exact_result)
+            cache_time = time.time() - cache_check_start
+            self._log_performance("cache_check", {
+                "duration": cache_time,
+                "type": "standard_exact"
+            })
+            return exact_result, "standard_exact", cache_time
+
+        # 5. 最后再尝试常规语义缓存，保留原有语义命中能力，但不再伪装成 fast path。
+        semantic_fallback = self.check_semantic_cache(
+            query,
+            thread_id,
+            high_quality_only=False
+        )
+        if self._is_valid_text_response(semantic_fallback):
+            self.global_cache_manager.set(query, semantic_fallback)
+            cache_time = time.time() - cache_check_start
+            self._log_performance("cache_check", {
+                "duration": cache_time,
+                "type": "semantic_fallback"
+            })
+            return semantic_fallback, "semantic_fallback", cache_time
+
         cache_time = time.time() - cache_check_start
         self._log_performance("cache_check", {
             "duration": cache_time,
             "type": "miss"
         })
-        
+        return None, "miss", cache_time
+    
+    def _check_all_caches(self, query: str, thread_id: str = "default"):
+        """整合的缓存检查方法"""
+        cached_result, cache_type, _ = self._lookup_cached_response(query, thread_id)
+        if self._is_valid_text_response(cached_result):
+            self._log_runtime_event(
+                "agent.cache_hit",
+                thread_id=thread_id,
+                cache_type=cache_type,
+                query_preview=shorten_text(query)
+            )
+            return cached_result
         return None
     
     def ask_with_trace(self, query: str, thread_id: str = "default", recursion_limit: Optional[int] = None) -> Dict:
@@ -365,54 +456,39 @@ class BaseAgent(ABC):
         
         # 确保查询字符串是干净的
         safe_query = query.strip()
+        self._log_runtime_event(
+            "agent.ask_with_trace.start",
+            thread_id=thread_id,
+            query_preview=shorten_text(safe_query)
+        )
         
-        # 首先尝试全局缓存（跨会话缓存）
-        global_cache_start = time.time()
-        global_result = self.global_cache_manager.get(safe_query)
-        global_cache_time = time.time() - global_cache_start
-        
-        if self._is_valid_text_response(global_result):
-            print(f"全局缓存命中: {safe_query[:30]}... ({global_cache_time:.4f}s)")
-            
-            return {
-                "answer": global_result,
-                "execution_log": [{"node": "global_cache_hit", "timestamp": time.time(), "input": safe_query, "output": "全局缓存命中"}]
-            }
-        
-        # 首先尝试快速路径 - 跳过验证的高质量缓存
-        fast_cache_start = time.time()
-        fast_result = self.check_fast_cache(safe_query, thread_id)
-        fast_cache_time = time.time() - fast_cache_start
-        
-        if self._is_valid_text_response(fast_result):
-            print(f"快速路径缓存命中: {safe_query[:30]}... ({fast_cache_time:.4f}s)")
-            
-            # 将命中的内容同步到全局缓存
-            self.global_cache_manager.set(safe_query, fast_result)
-            
-            return {
-                "answer": fast_result,
-                "execution_log": [{"node": "fast_cache_hit", "timestamp": time.time(), "input": safe_query, "output": "高质量缓存命中"}]
-            }
-        
-        # 尝试常规缓存路径
-        cache_start = time.time()
-        cached_response = self.cache_manager.get(safe_query, thread_id=thread_id)
-        cache_time = time.time() - cache_start
-        
+        cached_response, cache_type, cache_time = self._lookup_cached_response(
+            safe_query,
+            thread_id
+        )
         if self._is_valid_text_response(cached_response):
-            print(f"完整问答缓存命中: {safe_query[:30]}... ({cache_time:.4f}s)")
-            
-            # 将命中的内容同步到全局缓存
-            self.global_cache_manager.set(safe_query, cached_response)
-            
+            self._log_runtime_event(
+                "agent.ask_with_trace.cache_hit",
+                cache_type=cache_type,
+                duration=cache_time,
+                duration_ms=round(cache_time * 1000, 2)
+            )
             return {
                 "answer": cached_response,
-                "execution_log": [{"node": "cache_hit", "timestamp": time.time(), "input": safe_query, "output": "常规缓存命中"}]
+                "execution_log": [{
+                    "node": f"{cache_type}_cache_hit",
+                    "timestamp": time.time(),
+                    "input": safe_query,
+                    "output": f"缓存命中: {cache_type}"
+                }]
             }
         
         # 未命中缓存，执行标准流程
         process_start = time.time()
+        self._log_runtime_event(
+            "agent.ask_with_trace.processing_start",
+            thread_id=thread_id
+        )
         
         config = {
             "configurable": {
@@ -441,14 +517,19 @@ class BaseAgent(ABC):
                 self.global_cache_manager.set(safe_query, answer)
             
             process_time = time.time() - process_start
-            print(f"完整处理耗时: {process_time:.4f}s")
-            
             overall_time = time.time() - overall_start
             self._log_performance("ask_with_trace", {
                 "total_duration": overall_time,
                 "cache_check": cache_time,
                 "processing": process_time
             })
+            self._log_runtime_event(
+                "agent.ask_with_trace.success",
+                processing_duration=process_time,
+                processing_duration_ms=round(process_time * 1000, 2),
+                total_duration=overall_time,
+                total_duration_ms=round(overall_time * 1000, 2)
+            )
             
             return {
                 "answer": answer,
@@ -456,7 +537,12 @@ class BaseAgent(ABC):
             }
         except Exception as e:
             error_time = time.time() - process_start
-            print(f"处理查询时出错: {e} ({error_time:.4f}s)")
+            self._log_runtime_event(
+                "agent.ask_with_trace.error",
+                error=str(e),
+                duration=error_time,
+                duration_ms=round(error_time * 1000, 2)
+            )
             return {
                 "answer": f"抱歉，处理您的问题时遇到了错误。请稍后再试或换一种提问方式。错误详情: {str(e)}",
                 "execution_log": self.execution_log + [{"node": "error", "timestamp": time.time(), "input": query, "output": str(e)}]
@@ -468,9 +554,20 @@ class BaseAgent(ABC):
         
         # 确保查询字符串是干净的
         safe_query = query.strip()
+        self._log_runtime_event(
+            "agent.ask.start",
+            thread_id=thread_id,
+            query_preview=shorten_text(safe_query)
+        )
         
         cached_result = self._check_all_caches(safe_query, thread_id)
         if cached_result:
+            total_time = time.time() - overall_start
+            self._log_runtime_event(
+                "agent.ask.cache_hit",
+                total_duration=total_time,
+                total_duration_ms=round(total_time * 1000, 2)
+            )
             return cached_result
         
         # 未命中缓存，执行标准流程
@@ -513,11 +610,23 @@ class BaseAgent(ABC):
                 "cache_check": 0,  # 由_check_all_caches记录
                 "processing": process_time
             })
+            self._log_runtime_event(
+                "agent.ask.success",
+                processing_duration=process_time,
+                processing_duration_ms=round(process_time * 1000, 2),
+                total_duration=overall_time,
+                total_duration_ms=round(overall_time * 1000, 2)
+            )
             
             return answer
         except Exception as e:
             error_time = time.time() - process_start
-            print(f"处理查询时出错: {e} ({error_time:.4f}s)")
+            self._log_runtime_event(
+                "agent.ask.error",
+                error=str(e),
+                duration=error_time,
+                duration_ms=round(error_time * 1000, 2)
+            )
             return f"抱歉，处理您的问题时遇到了错误。请稍后再试或换一种提问方式。错误详情: {str(e)}"
     
     async def ask_stream(self, query: str, thread_id: str = "default", recursion_limit: Optional[int] = None) -> AsyncGenerator[str, None]:
@@ -536,59 +645,20 @@ class BaseAgent(ABC):
         
         # 确保查询字符串是干净的
         safe_query = query.strip()
-        
-        # 首先尝试全局缓存（跨会话缓存）
-        global_result = self.global_cache_manager.get(safe_query)
-        if global_result:
-            # 对于缓存响应，按自然语言单位分块返回
-            import re
-            chunks = re.split(r'([.!?。！？]\s*)', global_result)
-            buffer = ""
-            
-            for i in range(0, len(chunks)):
-                buffer += chunks[i]
-                
-                # 当缓冲区包含完整句子或达到合理大小时输出
-                if (i % 2 == 1) or len(buffer) >= self.stream_flush_threshold:
-                    yield buffer
-                    buffer = ""
-                    await asyncio.sleep(0.01)
-            
-            # 输出任何剩余内容
-            if buffer:
-                yield buffer
-            return
-        
-        # 首先尝试快速路径 - 跳过验证的高质量缓存
-        fast_result = self.check_fast_cache(safe_query, thread_id)
-        if fast_result:
-            # 对于缓存响应，按自然语言单位分块返回
-            import re
-            chunks = re.split(r'([.!?。！？]\s*)', fast_result)
-            buffer = ""
-            
-            for i in range(0, len(chunks)):
-                buffer += chunks[i]
-                
-                # 当缓冲区包含完整句子或达到合理大小时输出
-                if (i % 2 == 1) or len(buffer) >= self.stream_flush_threshold:
-                    yield buffer
-                    buffer = ""
-                    await asyncio.sleep(0.01)
-            
-            # 输出任何剩余内容
-            if buffer:
-                yield buffer
-                
-            # 将命中的内容同步到全局缓存
-            self.global_cache_manager.set(safe_query, fast_result)
-            return
-        
-        # 尝试常规缓存路径
-        cache_start = time.time()
-        cached_response = self.cache_manager.get(safe_query, thread_id=thread_id)
-        cache_time = time.time() - cache_start
-        
+        self._log_runtime_event(
+            "agent.ask_stream.start",
+            thread_id=thread_id,
+            query_preview=shorten_text(safe_query)
+        )
+        cache_lookup_start = time.time()
+        cached_response, _, _ = self._lookup_cached_response(safe_query, thread_id)
+        self._log_runtime_event(
+            "agent.ask_stream.cache_lookup",
+            thread_id=thread_id,
+            duration=time.time() - cache_lookup_start,
+            duration_ms=round((time.time() - cache_lookup_start) * 1000, 2),
+            hit=bool(cached_response),
+        )
         if cached_response:
             # 同样按自然语言单位分块
             import re
@@ -607,9 +677,11 @@ class BaseAgent(ABC):
             # 输出任何剩余内容
             if buffer:
                 yield buffer
-                
-            # 将命中的内容同步到全局缓存
-            self.global_cache_manager.set(safe_query, cached_response)
+            self._log_runtime_event(
+                "agent.ask_stream.cache_hit",
+                thread_id=thread_id,
+                response_length=len(cached_response)
+            )
             return
         
         # 未命中缓存，执行标准流程
@@ -628,30 +700,55 @@ class BaseAgent(ABC):
         
         inputs = {"messages": [HumanMessage(content=query)]}
         answer = ""
+        first_chunk_emitted = False
         
         try:
             # 执行流式处理
             async for chunk in self._stream_process(inputs, config):
+                if not first_chunk_emitted:
+                    self._log_runtime_event(
+                        "agent.ask_stream.first_chunk",
+                        thread_id=thread_id
+                    )
+                    first_chunk_emitted = True
                 yield chunk
                 answer += chunk
             
             # 缓存完整回答 - 同时更新会话缓存和全局缓存
             if answer and len(answer) > 10:
+                cache_store_start = time.time()
                 # 更新会话缓存
                 self.cache_manager.set(safe_query, answer, thread_id=thread_id)
                 # 更新全局缓存
                 self.global_cache_manager.set(safe_query, answer)
+                self._log_runtime_event(
+                    "agent.ask_stream.cache_store",
+                    thread_id=thread_id,
+                    duration=time.time() - cache_store_start,
+                    duration_ms=round((time.time() - cache_store_start) * 1000, 2),
+                )
             
             process_time = time.time() - overall_start
             self._log_performance("ask_stream", {
                 "total_duration": process_time,
                 "processing": process_time
             })
+            self._log_runtime_event(
+                "agent.ask_stream.success",
+                total_duration=process_time,
+                total_duration_ms=round(process_time * 1000, 2),
+                response_length=len(answer)
+            )
             
         except Exception as e:
             error_time = time.time() - overall_start
             error_msg = f"处理查询时出错: {str(e)} ({error_time:.4f}s)"
-            print(error_msg)
+            self._log_runtime_event(
+                "agent.ask_stream.error",
+                error=str(e),
+                duration=error_time,
+                duration_ms=round(error_time * 1000, 2)
+            )
             yield error_msg
     
     def mark_answer_quality(self, query: str, is_positive: bool, thread_id: str = "default"):

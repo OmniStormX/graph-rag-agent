@@ -1,5 +1,7 @@
 import re
 import traceback
+import hashlib
+import threading
 from typing import Dict, List, Any, Tuple
 from server_config.database import get_db_manager
 from utils.keywords import extract_smart_keywords
@@ -8,6 +10,83 @@ from utils.keywords import extract_smart_keywords
 # 获取数据库连接
 db_manager = get_db_manager()
 driver = db_manager.driver
+
+# 基于会话与回答内容的轻量知识图谱缓存。
+# 当前先使用进程内缓存，便于本地开发验证。
+_KG_CACHE_LOCK = threading.RLock()
+_KG_MESSAGE_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def build_kg_cache_key(
+    *,
+    session_id: str | None,
+    message: str,
+    query: str | None = None,
+) -> str:
+    """根据会话、回答文本和查询构造稳定缓存键。"""
+    message_hash = hashlib.md5((message or "").encode("utf-8")).hexdigest()
+    query_hash = hashlib.md5((query or "").encode("utf-8")).hexdigest()
+    return f"kg:{session_id or 'global'}:{message_hash}:{query_hash}"
+
+
+def get_cached_kg_data(
+    *,
+    kg_cache_key: str | None = None,
+    session_id: str | None = None,
+    message: str | None = None,
+    query: str | None = None,
+) -> Dict[str, Any] | None:
+    """按缓存键或消息内容获取已缓存的回答相关图谱。"""
+    cache_key = kg_cache_key
+    if not cache_key and message is not None:
+        cache_key = build_kg_cache_key(
+            session_id=session_id,
+            message=message,
+            query=query,
+        )
+
+    if not cache_key:
+        return None
+
+    with _KG_CACHE_LOCK:
+        cached = _KG_MESSAGE_CACHE.get(cache_key)
+        if cached is None:
+            return None
+        return dict(cached)
+
+
+def cache_kg_data_for_message(
+    *,
+    session_id: str | None,
+    message: str,
+    query: str | None,
+    kg_data: Dict[str, Any],
+) -> str:
+    """将回答相关图谱写入缓存，并返回缓存键。"""
+    cache_key = build_kg_cache_key(
+        session_id=session_id,
+        message=message,
+        query=query,
+    )
+    with _KG_CACHE_LOCK:
+        _KG_MESSAGE_CACHE[cache_key] = dict(kg_data or {"nodes": [], "links": []})
+    return cache_key
+
+
+def clear_cached_kg_data(session_id: str | None = None) -> None:
+    """清理指定会话或全部回答相关图谱缓存。"""
+    with _KG_CACHE_LOCK:
+        if not session_id:
+            _KG_MESSAGE_CACHE.clear()
+            return
+
+        prefix = f"kg:{session_id}:"
+        cache_keys = [
+            cache_key for cache_key in _KG_MESSAGE_CACHE
+            if cache_key.startswith(prefix)
+        ]
+        for cache_key in cache_keys:
+            _KG_MESSAGE_CACHE.pop(cache_key, None)
 
 
 def _deduplicate_ids(values: List[Any]) -> List[Any]:

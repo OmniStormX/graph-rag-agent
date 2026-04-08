@@ -106,6 +106,7 @@ def render_answer_with_hover_citations(
     if not isinstance(content, str) or not content:
         return content
 
+    rendered = content
     placeholder_map = {}
 
     def _store_placeholder(html_fragment: str) -> str:
@@ -125,8 +126,6 @@ def render_answer_with_hover_citations(
             f"data-evidence-target='{escaped_id}'>{escaped_keyword}</span>"
         )
         return _store_placeholder(html_fragment)
-
-    rendered = content
 
     # 优先处理新协议：[[ref:关键词|证据ID]]。
     rendered = re.sub(

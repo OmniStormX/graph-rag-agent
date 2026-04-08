@@ -1,6 +1,7 @@
 from typing import Dict, List
 import threading
 from langchain_core.messages import RemoveMessage, AIMessage, HumanMessage, ToolMessage
+from services.kg_service import clear_cached_kg_data
 
 
 # 创建Agent管理类
@@ -95,6 +96,9 @@ class AgentManager:
                             i = i - 1
                             if i == 2:  # 保留前两条消息
                                 break
+
+            # 同步清除该会话的回答相关图谱缓存，避免旧消息图谱残留。
+            clear_cached_kg_data(session_id)
             
             # 获取剩余消息
             remaining_text = "已清除会话历史"
@@ -158,6 +162,9 @@ class AgentManager:
                     cleared_agents.append(current_agent_type)
                 except Exception as e:
                     print(f"清除 {current_agent_type} 缓存时出错: {e}")
+
+        # Agent 缓存清理时，同步清除对应会话的图谱缓存。
+        clear_cached_kg_data(session_id)
 
         if not cleared_agents:
             return {
