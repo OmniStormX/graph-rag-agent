@@ -15,6 +15,17 @@ from graphrag_agent.config.taxonomy import (
 load_dotenv()
 
 
+def _get_env_str(key: str, default: str) -> str:
+    """获取字符串环境变量，并清理首尾空白与包裹引号。"""
+    raw = os.getenv(key)
+    if raw is None:
+        return default
+    value = raw.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1].strip()
+    return value or default
+
+
 def _get_env_int(key: str, default: Optional[int]) -> Optional[int]:
     """获取整型环境变量，未设置时返回默认值"""
     raw = os.getenv(key)
@@ -214,6 +225,26 @@ CACHE_SETTINGS = {
     "max_vectors": _get_env_int("CACHE_MAX_VECTORS", 10000) or 10000,
 }
 
+# ===== 图谱后台配置 =====
+
+GRAPH_ADMIN_ENABLED = _get_env_bool("GRAPH_ADMIN_ENABLED", True)
+GRAPH_ADMIN_METADATA_DSN = os.getenv("GRAPH_ADMIN_METADATA_DSN", "")
+GRAPH_ADMIN_RUNTIME_DIR = Path(
+    os.getenv("GRAPH_ADMIN_RUNTIME_DIR", PROJECT_ROOT / "runtime" / "admin")
+).expanduser()
+GRAPH_ADMIN_BUILD_LOG_DIR = Path(
+    os.getenv("GRAPH_ADMIN_BUILD_LOG_DIR", GRAPH_ADMIN_RUNTIME_DIR / "build_logs")
+).expanduser()
+GRAPH_ADMIN_SNAPSHOT_DIR = Path(
+    os.getenv("GRAPH_ADMIN_SNAPSHOT_DIR", GRAPH_ADMIN_RUNTIME_DIR / "snapshots")
+).expanduser()
+GRAPH_ADMIN_UPLOAD_DIR = Path(
+    os.getenv("GRAPH_ADMIN_UPLOAD_DIR", GRAPH_ADMIN_RUNTIME_DIR / "uploads")
+).expanduser()
+GRAPH_ADMIN_BACKEND_LOG_PATH = os.getenv("GRAPH_ADMIN_BACKEND_LOG_PATH", "")
+GRAPH_ADMIN_FRONTEND_LOG_PATH = os.getenv("GRAPH_ADMIN_FRONTEND_LOG_PATH", "")
+GRAPH_ADMIN_MAX_LOG_LINES = _get_env_int("GRAPH_ADMIN_MAX_LOG_LINES", 500) or 500
+
 # ===== Neo4j 连接配置 =====
 
 NEO4J_URI = os.getenv("NEO4J_URI", "")
@@ -296,7 +327,8 @@ LOCAL_SEARCH_SETTINGS = {
     )
     or 10,
     "top_entities": _get_env_int("LOCAL_SEARCH_TOP_ENTITIES", 10) or 10,
-    "index_name": os.getenv("LOCAL_SEARCH_INDEX_NAME", "vector"),
+    # 统一清理索引名格式，避免 `.env` 中的引号或空白导致匹配异常。
+    "index_name": _get_env_str("LOCAL_SEARCH_INDEX_NAME", "vector"),
 }
 
 GLOBAL_SEARCH_SETTINGS = {

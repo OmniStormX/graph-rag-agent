@@ -9,6 +9,10 @@ import time
 
 from graphrag_agent.config.settings import MAX_WORKERS
 from graphrag_agent.config.prompts import COMMUNITY_SUMMARY_PROMPT
+from graphrag_agent.community.summary.utils import (
+    derive_topic_from_text,
+    parse_community_summary_payload,
+)
 
 class BaseCommunityDescriber:
     """社区信息格式化工具"""
@@ -109,7 +113,8 @@ class BaseCommunityStorer:
                 self.graph.query("""
                 UNWIND $data AS row
                 MERGE (c:__Community__ {id:row.community})
-                SET c.summary = row.summary, 
+                SET c.topic = row.topic,
+                    c.summary = row.summary, 
                     c.full_content = row.full_content,
                     c.summary_created_at = datetime()
                 """, params={"data": batch})
@@ -127,7 +132,8 @@ class BaseCommunityStorer:
             try:
                 self.graph.query("""
                 MERGE (c:__Community__ {id:$community})
-                SET c.summary = $summary, 
+                SET c.topic = $topic,
+                    c.summary = $summary, 
                     c.full_content = $full_content,
                     c.summary_created_at = datetime()
                 """, params=summary)
@@ -261,21 +267,28 @@ class BaseSummarizer(ABC):
                 print(f"社区 {community_id} 的信息太少，跳过摘要生成")
                 return {
                     "community": community_id,
+                    "topic": "信息不足的社区",
                     "summary": "此社区没有足够的信息生成摘要。",
                     "full_content": stringify_info
                 }
             
-            summary = self.community_chain.invoke({'community_info': stringify_info})
+            raw_output = self.community_chain.invoke({'community_info': stringify_info})
+            parsed_output = parse_community_summary_payload(
+                raw_output,
+                fallback_text=stringify_info,
+            )
             
             return {
                 "community": community_id,
-                "summary": summary,
+                "topic": parsed_output["topic"],
+                "summary": parsed_output["summary"],
                 "full_content": stringify_info
             }
         except Exception as e:
             print(f"处理社区 {community_id} 摘要时出错: {e}")
             return {
                 "community": community_id,
+                "topic": derive_topic_from_text(str(community_id)),
                 "summary": f"生成摘要时出错: {str(e)}",
                 "full_content": str(community)
             }

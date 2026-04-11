@@ -19,6 +19,7 @@ TASK_TYPE_CHOICES: Tuple[str, ...] = (
     "deep_research",
     "deeper_research",
     "chain_exploration",
+    "fluid_property_calc",
     "reflection",
     "custom",
 )
@@ -31,6 +32,7 @@ TaskTypeLiteral = Literal[
     "deep_research",
     "deeper_research",
     "chain_exploration",
+    "fluid_property_calc",
     "reflection",
     "custom",
 ]

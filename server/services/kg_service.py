@@ -1100,7 +1100,7 @@ def get_knowledge_graph(limit: int = 100, query: str = None) -> Dict:
         print(f"获取知识图谱数据失败: {str(e)}")
         return {"error": str(e), "nodes": [], "links": []}
 
-def get_source_content(source_id: str) -> str:
+def get_source_content(source_id: str) -> Dict[str, Any]:
     """
     根据源ID获取内容
     
@@ -1108,20 +1108,28 @@ def get_source_content(source_id: str) -> str:
         source_id: 源ID
         
     Returns:
-        str: 源内容
+        Dict[str, Any]: 结构化源内容
     """
     try:
         if not source_id:
-            return "未提供有效的源ID"
+            return {
+                "source_id": source_id,
+                "source_type": "unknown",
+                "content": "未提供有效的源ID",
+                "error": "未提供有效的源ID",
+            }
         
         # 检查ID是否为Chunk ID (直接使用)
         if len(source_id) == 40:  # SHA1哈希的长度
             query = """
             MATCH (n:__Chunk__) 
             WHERE n.id = $id 
-            RETURN n.fileName AS fileName, n.text AS text
+            RETURN n.fileName AS fileName, n.text AS text,
+                   n.position AS position, n.length AS length,
+                   n.content_offset AS content_offset, n.id AS chunk_id
             """
             params = {"id": source_id}
+            source_type = "chunk"
         else:
             # 尝试解析复合ID
             id_parts = source_id.split(",")
@@ -1130,16 +1138,20 @@ def get_source_content(source_id: str) -> str:
                 query = """
                 MATCH (n:__Chunk__) 
                 WHERE n.id = $id 
-                RETURN n.fileName AS fileName, n.text AS text
+                RETURN n.fileName AS fileName, n.text AS text,
+                       n.position AS position, n.length AS length,
+                       n.content_offset AS content_offset, n.id AS chunk_id
                 """
                 params = {"id": id_parts[-1]}
+                source_type = "chunk"
             else:  # 社区查询
                 query = """
                 MATCH (n:__Community__) 
                 WHERE n.id = $id 
-                RETURN n.summary AS summary, n.full_content AS full_content
+                RETURN n.id AS community_id, n.summary AS summary, n.full_content AS full_content
                 """
                 params = {"id": id_parts[1] if len(id_parts) > 1 else source_id}
+                source_type = "community"
         
         from neo4j import Result
         result = driver.execute_query(
@@ -1150,16 +1162,64 @@ def get_source_content(source_id: str) -> str:
         
         if result is not None and result.shape[0] > 0:
             if "text" in result.columns:
-                content = f"文件名: {result.iloc[0]['fileName']}\n\n{result.iloc[0]['text']}"
+                row = result.iloc[0]
+                file_name = row.get("fileName")
+                text = row.get("text") or ""
+                position = row.get("position")
+                length = row.get("length")
+                content_offset = row.get("content_offset")
+                chunk_id = row.get("chunk_id")
+                title = f"文本块原文 · {file_name or '未知文件'}"
+                meta_lines = [f"文件名: {file_name or '未知文件'}"]
+                if position is not None:
+                    meta_lines.append(f"块序号: {position}")
+                if length is not None:
+                    meta_lines.append(f"长度: {length}")
+                if content_offset is not None:
+                    meta_lines.append(f"偏移量: {content_offset}")
+
+                return {
+                    "source_id": source_id,
+                    "source_type": source_type,
+                    "title": title,
+                    "file_name": file_name,
+                    "chunk_id": chunk_id,
+                    "text": text,
+                    "position": int(position) if position is not None else None,
+                    "length": int(length) if length is not None else None,
+                    "content_offset": int(content_offset) if content_offset is not None else None,
+                    "content": "\n".join(meta_lines) + "\n\n" + str(text),
+                }
             else:
-                content = f"摘要:\n{result.iloc[0]['summary']}\n\n全文:\n{result.iloc[0]['full_content']}"
-        else:
-            content = f"未找到相关内容: 源ID {source_id}"
-            
-        return content
+                row = result.iloc[0]
+                summary = row.get("summary") or ""
+                full_content = row.get("full_content") or ""
+                community_id = row.get("community_id")
+                title = f"社区原文 · {community_id or source_id}"
+                return {
+                    "source_id": source_id,
+                    "source_type": source_type,
+                    "title": title,
+                    "community_id": str(community_id or ""),
+                    "summary": str(summary),
+                    "full_content": str(full_content),
+                    "content": f"摘要:\n{summary}\n\n全文:\n{full_content}",
+                }
+
+        return {
+            "source_id": source_id,
+            "source_type": source_type,
+            "content": f"未找到相关内容: 源ID {source_id}",
+            "error": "未找到相关内容",
+        }
     except Exception as e:
         print(f"获取源内容时出错: {str(e)}")
-        return f"检索源内容时发生错误: {str(e)}"
+        return {
+            "source_id": source_id,
+            "source_type": "unknown",
+            "content": f"检索源内容时发生错误: {str(e)}",
+            "error": str(e),
+        }
     
 
 def get_source_file_info(source_id: str) -> dict:

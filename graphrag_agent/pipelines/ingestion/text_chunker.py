@@ -1,11 +1,15 @@
-import hanlp
 import re
 from typing import List, Tuple
 
 from graphrag_agent.config.settings import CHUNK_SIZE, OVERLAP, MAX_TEXT_LENGTH
 
+try:
+    import pysbd
+except ImportError:  # pragma: no cover - 依赖缺失时回退到正则断句
+    pysbd = None
+
 class ChineseTextChunker:
-    """中文文本分块器，将长文本分割成带有重叠的文本块"""
+    """中英混合文本分块器，将长文本分割成带有重叠的文本块。"""
     
     def __init__(self, chunk_size: int = CHUNK_SIZE, overlap: int = OVERLAP, max_text_length: int = MAX_TEXT_LENGTH):
         """
@@ -22,7 +26,12 @@ class ChineseTextChunker:
         self.chunk_size = chunk_size
         self.overlap = overlap
         self.max_text_length = max_text_length
-        self.tokenizer = hanlp.load(hanlp.pretrained.tok.COARSE_ELECTRA_SMALL_ZH)
+        self.tokenizer = None
+        self._hanlp_module = None
+        self.english_sentence_segmenter = (
+            pysbd.Segmenter(language="en", clean=False)
+            if pysbd is not None else None
+        )
         
     def process_files(self, file_contents: List[Tuple[str, str]]) -> List[Tuple[str, str, List[List[str]]]]:
         """
@@ -173,14 +182,35 @@ class ChineseTextChunker:
             分词结果列表
         """
         try:
+            tokenizer = self._get_or_create_tokenizer()
+            if tokenizer is None:
+                return list(text)
+
             # 检查文本长度
             if len(text) > self.max_text_length:
                 return list(text)
             
-            tokens = self.tokenizer(text)
+            tokens = tokenizer(text)
             return tokens if tokens else []
         except Exception:
             return list(text)
+
+    def _get_or_create_tokenizer(self):
+        """按需初始化中文分词器，避免英文构建也触发 HanLP/Torch 启动。"""
+        if self.tokenizer is not None:
+            return self.tokenizer
+
+        try:
+            if self._hanlp_module is None:
+                import hanlp
+
+                self._hanlp_module = hanlp
+            self.tokenizer = self._hanlp_module.load(
+                self._hanlp_module.pretrained.tok.COARSE_ELECTRA_SMALL_ZH
+            )
+        except Exception:
+            self.tokenizer = None
+        return self.tokenizer
         
     def chunk_text(self, text: str) -> List[List[str]]:
         """
@@ -196,6 +226,10 @@ class ChineseTextChunker:
         if not text or len(text) < self.chunk_size / 10:
             tokens = self._safe_tokenize(text)
             return [tokens] if tokens else []
+
+        # 英文教材优先使用句子级切块，避免中文分词器导致切片零碎、信息密度偏低。
+        if self._is_english_dominant(text):
+            return self._chunk_english_text(text)
         
         # 预处理过大文本
         text_segments = self._preprocess_large_text(text)
@@ -228,6 +262,7 @@ class ChineseTextChunker:
         
         chunks = []
         start_pos = 0
+        dynamic_overlap = self._compute_dynamic_overlap(len(all_tokens))
         
         while start_pos < len(all_tokens):
             # 确定当前块的结束位置
@@ -242,7 +277,8 @@ class ChineseTextChunker:
             
             # 提取当前块
             chunk = all_tokens[start_pos:end_pos]
-            if chunk:  # 确保块不为空
+            chunk_text = ''.join(chunk).strip()
+            if chunk and not self._is_low_value_chinese_chunk(chunk_text):
                 chunks.append(chunk)
             
             # 计算下一块的起始位置（考虑重叠）
@@ -250,7 +286,7 @@ class ChineseTextChunker:
                 break
                 
             # 寻找重叠的起始位置
-            overlap_start = max(start_pos, end_pos - self.overlap)
+            overlap_start = max(start_pos, end_pos - dynamic_overlap)
             next_sentence_start = self._find_previous_sentence_end(all_tokens, overlap_start)
             
             # 如果找到合适的句子开始位置，使用它；否则使用计算的重叠位置
@@ -264,10 +300,19 @@ class ChineseTextChunker:
                 start_pos = end_pos
         
         return chunks
+
+    def _compute_dynamic_overlap(self, token_count: int) -> int:
+        """根据分块规模动态调整重叠，避免固定 overlap 造成重复上下文过大。"""
+        if token_count <= self.chunk_size:
+            return 0
+        base_overlap = min(self.overlap, max(20, int(self.chunk_size * 0.15)))
+        if token_count > self.chunk_size * 4:
+            return max(20, int(base_overlap * 0.7))
+        return base_overlap
     
     def _is_sentence_end(self, token: str) -> bool:
         """判断token是否为句子结束符"""
-        return token in ['。', '！', '？']
+        return token in ['。', '！', '？', '.', '!', '?']
     
     def _find_next_sentence_end(self, tokens: List[str], start_pos: int) -> int:
         """从指定位置向后查找句子结束位置"""
@@ -282,6 +327,280 @@ class ChineseTextChunker:
             if self._is_sentence_end(tokens[i]):
                 return i + 1
         return 0
+
+    def _is_english_dominant(self, text: str) -> bool:
+        """判断文本是否以英文为主。"""
+        letters = re.findall(r"[A-Za-z]", text)
+        chinese_chars = re.findall(r"[\u4e00-\u9fff]", text)
+        if not letters:
+            return False
+        return len(letters) > max(120, len(chinese_chars) * 2)
+
+    def _chunk_english_text(self, text: str) -> List[List[str]]:
+        """对英文主导文本执行句子级切块。
+
+        处理策略：
+            1. 基于段落组织输入，优先保留原始语义边界。
+            2. 使用 pySBD 进行英文断句；若依赖不存在，则回退到正则方案。
+            3. 按 token 预算累积句子，并保留轻量 overlap。
+            4. 过滤图注、题号、目录碎片等低价值块。
+        """
+        normalized_text = re.sub(r"\n{3,}", "\n\n", text)
+        paragraphs = [
+            self._normalize_english_paragraph(segment)
+            for segment in normalized_text.split("\n\n")
+            if segment.strip()
+        ]
+        paragraphs = [paragraph for paragraph in paragraphs if paragraph]
+        if not paragraphs:
+            return [list(normalized_text)] if normalized_text.strip() else []
+
+        target_tokens = max(self.chunk_size, 220)
+        overlap_tokens = max(int(target_tokens * 0.12), 40)
+        chunks: List[List[str]] = []
+        current_sentences: List[str] = []
+        current_tokens = 0
+
+        for paragraph in paragraphs:
+            if self._is_noise_paragraph(paragraph):
+                continue
+
+            paragraph_sentences = self._split_english_sentences(paragraph)
+            if not paragraph_sentences:
+                continue
+
+            for sentence in paragraph_sentences:
+                normalized_sentence = self._normalize_english_sentence(sentence)
+                if not normalized_sentence or self._is_noise_sentence(normalized_sentence):
+                    continue
+
+                fragments = self._split_long_english_sentence(
+                    normalized_sentence,
+                    max_tokens=max(target_tokens // 2, 120),
+                )
+                for fragment in fragments:
+                    fragment_tokens = self._estimate_english_tokens(fragment)
+                    if current_sentences and current_tokens + fragment_tokens > target_tokens:
+                        finalized_chunk = self._finalize_english_chunk(current_sentences)
+                        if finalized_chunk:
+                            chunks.append(list(finalized_chunk))
+
+                        current_sentences = self._build_overlap_sentences(
+                            current_sentences,
+                            overlap_tokens,
+                        )
+                        current_tokens = self._sum_sentence_tokens(current_sentences)
+
+                    current_sentences.append(fragment)
+                    current_tokens += fragment_tokens
+
+            # 段落边界轻微收束，避免将过多段落挤进同一块。
+            if current_sentences and current_tokens >= int(target_tokens * 0.88):
+                finalized_chunk = self._finalize_english_chunk(current_sentences)
+                if finalized_chunk:
+                    chunks.append(list(finalized_chunk))
+                current_sentences = self._build_overlap_sentences(
+                    current_sentences,
+                    overlap_tokens,
+                )
+                current_tokens = self._sum_sentence_tokens(current_sentences)
+
+        if current_sentences:
+            finalized_chunk = self._finalize_english_chunk(current_sentences)
+            if finalized_chunk:
+                chunks.append(list(finalized_chunk))
+
+        return chunks
+
+    def _split_english_sentences(self, text: str) -> List[str]:
+        """按英文句子边界切分文本。"""
+        normalized = re.sub(r"\s+", " ", text).strip()
+        if not normalized:
+            return []
+
+        if self.english_sentence_segmenter is not None:
+            parts = self.english_sentence_segmenter.segment(normalized)
+            return [part.strip() for part in parts if part.strip()]
+
+        parts = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9(\"'])", normalized)
+        return [part.strip() for part in parts if part.strip()]
+
+    def _split_long_english_sentence(self, sentence: str, max_tokens: int) -> List[str]:
+        """拆分超长英文句子，优先在从句边界切开。"""
+        if self._estimate_english_tokens(sentence) <= max_tokens:
+            return [sentence]
+
+        clauses = re.split(r"(?<=[,;:])\s+", sentence)
+        if len(clauses) <= 1:
+            return self._split_english_fragment_by_words(sentence, max_tokens)
+
+        fragments: List[str] = []
+        current_fragment = ""
+        for clause in clauses:
+            clause = clause.strip()
+            if not clause:
+                continue
+            candidate = f"{current_fragment} {clause}".strip()
+            if current_fragment and self._estimate_english_tokens(candidate) > max_tokens:
+                fragments.append(current_fragment)
+                current_fragment = clause
+            else:
+                current_fragment = candidate
+        if current_fragment:
+            fragments.append(current_fragment)
+        return fragments or self._split_english_fragment_by_words(sentence, max_tokens)
+
+    def _normalize_english_paragraph(self, paragraph: str) -> str:
+        """清洗英文段落，减少 PDF 版式残留。"""
+        normalized = re.sub(r"\s+", " ", paragraph).strip()
+        normalized = normalized.replace("ﬁ", "fi").replace("ﬂ", "fl")
+        normalized = normalized.replace("–", "-").replace("—", "-")
+        normalized = re.sub(r"\b([A-Za-z])\s+([A-Za-z]{1,2})\b", r"\1 \2", normalized)
+        return normalized
+
+    def _normalize_english_sentence(self, sentence: str) -> str:
+        """进一步清洗句子级文本。"""
+        normalized = re.sub(r"\s+", " ", sentence).strip(" -\t\r\n")
+        normalized = re.sub(r"\s+([,.;:!?])", r"\1", normalized)
+        return normalized
+
+    def _estimate_english_tokens(self, text: str) -> int:
+        """近似估算英文 token 数，用于控制 chunk 预算。
+
+        说明：
+            这里不强依赖 tiktoken，避免为构建流程引入新的重量级依赖。
+            对英文教材文本，按单词和标点近似估算即可满足分块预算控制。
+        """
+        units = re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?|\d+(?:\.\d+)?|[^\w\s]", text)
+        return len(units)
+
+    def _sum_sentence_tokens(self, sentences: List[str]) -> int:
+        """计算句子列表的近似 token 总量。"""
+        return sum(self._estimate_english_tokens(sentence) for sentence in sentences)
+
+    def _build_overlap_sentences(
+        self,
+        sentences: List[str],
+        overlap_tokens: int,
+    ) -> List[str]:
+        """基于句子级重叠构造下一块的起始上下文。"""
+        if not sentences:
+            return []
+
+        overlap_sentences: List[str] = []
+        running_tokens = 0
+        for sentence in reversed(sentences):
+            overlap_sentences.insert(0, sentence)
+            running_tokens += self._estimate_english_tokens(sentence)
+            if running_tokens >= overlap_tokens:
+                break
+        return overlap_sentences
+
+    def _finalize_english_chunk(self, sentences: List[str]) -> str:
+        """整理英文块文本并过滤低价值内容。"""
+        chunk_text = " ".join(sentence.strip() for sentence in sentences if sentence.strip())
+        chunk_text = re.sub(r"\s+", " ", chunk_text).strip()
+        if not chunk_text:
+            return ""
+        if self._is_low_quality_chunk(chunk_text):
+            return ""
+        return chunk_text
+
+    def _is_noise_paragraph(self, paragraph: str) -> bool:
+        """过滤明显属于目录、图注或题号页的段落。"""
+        stripped = paragraph.strip()
+        if not stripped:
+            return True
+        if "final pdf to printer" in stripped.lower():
+            return True
+        if re.match(r"^figure\s+", stripped, flags=re.IGNORECASE) and len(stripped) < 220:
+            return True
+        if re.match(r"^cyu\s+\d", stripped, flags=re.IGNORECASE):
+            return True
+        if re.match(r"^\d+[–-]\d+\b", stripped):
+            return True
+        if stripped.count(".") >= 8 and len(stripped.split()) < 30:
+            return True
+        return False
+
+    def _is_noise_sentence(self, sentence: str) -> bool:
+        """过滤低价值句子，减少图号与习题噪声进入 chunk。"""
+        stripped = sentence.strip()
+        if not stripped:
+            return True
+        if "final pdf to printer" in stripped.lower():
+            return True
+        if re.match(r"^figure\s+", stripped, flags=re.IGNORECASE) and len(stripped) < 220:
+            return True
+        if re.match(r"^cyu\s+\d", stripped, flags=re.IGNORECASE):
+            return True
+        if re.match(r"^\d+[–-]\d+\b", stripped):
+            return True
+        if "answer:" in stripped.lower() and len(stripped) < 240:
+            return True
+        if len(re.findall(r"[A-Za-z]", stripped)) < 8 and len(re.findall(r"\d", stripped)) > 4:
+            return True
+        return False
+
+    def _is_low_quality_chunk(self, chunk_text: str) -> bool:
+        """过滤整体质量偏低的英文块。"""
+        token_count = self._estimate_english_tokens(chunk_text)
+        if token_count < max(30, int(self.chunk_size * 0.08)):
+            return True
+
+        lower_text = chunk_text.lower()
+        if lower_text.count("figure") >= 2 and token_count < 120:
+            return True
+        if lower_text.count("cyu") >= 2:
+            return True
+        if re.fullmatch(r"[\W\d\s]+", chunk_text):
+            return True
+        return False
+
+    def _is_low_value_chinese_chunk(self, chunk_text: str) -> bool:
+        """过滤中文或混合文本中的低价值块，减少无效抽取。"""
+        normalized = re.sub(r"\s+", "", chunk_text)
+        if not normalized:
+            return True
+
+        chinese_count = len(re.findall(r"[\u4e00-\u9fff]", normalized))
+        english_count = len(re.findall(r"[A-Za-z]", normalized))
+        if chinese_count + english_count < max(20, int(self.chunk_size * 0.06)):
+            return True
+
+        if re.fullmatch(r"[\W\d_]+", normalized):
+            return True
+
+        if normalized.count("图") >= 2 and len(normalized) < 80:
+            return True
+        if normalized.count("表") >= 2 and len(normalized) < 80:
+            return True
+        if len(set(normalized)) / max(len(normalized), 1) < 0.12 and len(normalized) > 100:
+            return True
+        return False
+
+    def _split_english_fragment_by_words(self, text: str, max_tokens: int) -> List[str]:
+        """在无明显从句边界时按词级预算切分英文长句。"""
+        words = text.split()
+        if not words:
+            return []
+
+        fragments: List[str] = []
+        current_words: List[str] = []
+        current_tokens = 0
+        for word in words:
+            word_tokens = self._estimate_english_tokens(word)
+            if current_words and current_tokens + word_tokens > max_tokens:
+                fragments.append(" ".join(current_words))
+                current_words = [word]
+                current_tokens = word_tokens
+            else:
+                current_words.append(word)
+                current_tokens += word_tokens
+
+        if current_words:
+            fragments.append(" ".join(current_words))
+        return fragments
     
     def get_text_stats(self, text: str) -> dict:
         """

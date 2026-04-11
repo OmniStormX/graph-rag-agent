@@ -15,6 +15,7 @@ from graphrag_agent.search.tool.deep_research_tool import DeepResearchTool
 from graphrag_agent.search.tool.deeper_research_tool import DeeperResearchTool
 from graphrag_agent.search.tool.chain_exploration_tool import ChainOfExplorationTool
 from graphrag_agent.search.tool.hypothesis_tool import HypothesisGeneratorTool
+from graphrag_agent.search.tool.fluid_property_tool import FluidPropertyTool
 from graphrag_agent.search.tool.validation_tool import AnswerValidationTool
 
 TOOL_REGISTRY: Dict[str, Type[BaseSearchTool]] = {
@@ -30,6 +31,7 @@ TOOL_REGISTRY: Dict[str, Type[BaseSearchTool]] = {
 EXTRA_TOOL_FACTORIES: Dict[str, Any] = {
     "chain_exploration": ChainOfExplorationTool,
     "hypothesis_generator": HypothesisGeneratorTool,
+    "fluid_property_calc": FluidPropertyTool,
     "answer_validator": AnswerValidationTool,
 }
 

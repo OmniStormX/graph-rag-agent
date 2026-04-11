@@ -1,5 +1,6 @@
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
+from datetime import datetime
 from graphrag_agent.config.settings import community_algorithm
 
 
@@ -31,6 +32,19 @@ class SourceRequest(BaseModel):
 class SourceResponse(BaseModel):
     """源内容响应模型"""
     content: str
+    source_id: Optional[str] = None
+    source_type: Optional[str] = None
+    title: Optional[str] = None
+    file_name: Optional[str] = None
+    chunk_id: Optional[str] = None
+    community_id: Optional[str] = None
+    summary: Optional[str] = None
+    full_content: Optional[str] = None
+    text: Optional[str] = None
+    position: Optional[int] = None
+    length: Optional[int] = None
+    content_offset: Optional[int] = None
+    error: Optional[str] = None
 
 
 class SourceInfoResponse(BaseModel):
@@ -145,3 +159,76 @@ class RelationDeleteData(BaseModel):
     source: str
     type: str
     target: str
+
+
+class BuildRequest(BaseModel):
+    """后台构建请求。"""
+    version_name: Optional[str] = None
+    document_revision_ids: Optional[List[str]] = None
+
+
+class ActivateVersionRequest(BaseModel):
+    """激活或回滚版本请求。"""
+    activate: bool = True
+
+
+class CorrectionRuleCreateRequest(BaseModel):
+    """修正规则创建请求。"""
+    rule_type: str
+    title: str
+    content: str
+    scope_type: str = "global"
+    scope_id: Optional[str] = None
+    enabled: bool = True
+
+
+class BuildJobItem(BaseModel):
+    """后台构建任务条目。"""
+    job_id: str
+    version_id: str
+    job_type: str
+    status: str
+    message: Optional[str] = None
+    created_at: datetime
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    log_path: Optional[str] = None
+
+
+class BuildJobPageResponse(BaseModel):
+    """后台构建任务分页响应。"""
+    items: List[BuildJobItem]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+    keyword: Optional[str] = None
+    status: Optional[str] = None
+
+
+class AdminStatusResponse(BaseModel):
+    """后台系统状态响应。"""
+    metadata_db_connected: bool
+    neo4j_connected: bool
+    active_version_id: Optional[str] = None
+    active_version_name: Optional[str] = None
+    latest_job: Optional[BuildJobItem] = None
+    document_count: int = 0
+    version_count: int = 0
+
+
+class LogResponse(BaseModel):
+    """日志查看响应。"""
+    path: Optional[str] = None
+    lines: List[str]
+
+
+class AdminActionRequest(BaseModel):
+    """后台进程控制请求。"""
+    target: str
+    action: str
+
+
+class AdminResetRequest(BaseModel):
+    """后台重置请求。"""
+    confirm: bool = False

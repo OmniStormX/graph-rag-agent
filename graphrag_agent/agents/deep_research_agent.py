@@ -14,6 +14,7 @@ from graphrag_agent.config.prompts import (
 from graphrag_agent.config.settings import response_type
 from graphrag_agent.search.tool.deeper_research_tool import DeeperResearchTool
 from graphrag_agent.search.tool.deep_research_tool import DeepResearchTool 
+from graphrag_agent.search.tool.fluid_property_tool import FluidPropertyTool
 
 from graphrag_agent.agents.base import BaseAgent
 
@@ -68,6 +69,7 @@ class DeepResearchAgent(BaseAgent):
         
         # 设置缓存目录
         self.cache_dir = "./cache/enhanced_research_agent"
+        self.fluid_property_tool = FluidPropertyTool()
         
         # 设置查看推理过程的模式
         self.show_thinking = False
@@ -110,6 +112,7 @@ class DeepResearchAgent(BaseAgent):
         
         # 流式工具总是添加
         tools.append(self.stream_tool)
+        tools.append(self.fluid_property_tool.get_tool())
             
         return tools
     

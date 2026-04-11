@@ -2,7 +2,8 @@ import time
 import os
 import pickle
 import concurrent.futures
-from typing import List, Tuple, Optional
+import re
+from typing import Dict, List, Tuple, Optional
 from langchain.prompts import (
     ChatPromptTemplate,
     HumanMessagePromptTemplate,
@@ -10,8 +11,12 @@ from langchain.prompts import (
     SystemMessagePromptTemplate,
 )
 
-from graphrag_agent.graph.core import retry, generate_hash
+from graphrag_agent.graph.core import retry, generate_hash, is_non_retryable_llm_error
 from graphrag_agent.config.settings import MAX_WORKERS as DEFAULT_MAX_WORKERS, BATCH_SIZE as DEFAULT_BATCH_SIZE
+from graphrag_agent.config.prompts.graph_prompts import (
+    system_template_build_graph_batch,
+    human_template_build_graph_batch,
+)
 
 class EntityRelationExtractor:
     """
@@ -19,9 +24,11 @@ class EntityRelationExtractor:
     使用LLM分析文本块，生成结构化的实体和关系数据。
     """
     
-    def __init__(self, llm, system_template, human_template, 
+    def __init__(self, llm, system_template, human_template,
              entity_types: List[str], relationship_types: List[str],
-             cache_dir="./cache/graph", max_workers=4, batch_size=5):
+             cache_dir="./cache/graph", max_workers=4, batch_size=5,
+             batch_system_template: Optional[str] = None,
+             batch_human_template: Optional[str] = None):
         """
         初始化实体关系提取器
         
@@ -54,9 +61,22 @@ class EntityRelationExtractor:
             MessagesPlaceholder("chat_history"),
             human_message_prompt
         ])
+
+        batch_system_message_prompt = SystemMessagePromptTemplate.from_template(
+            batch_system_template or system_template_build_graph_batch
+        )
+        batch_human_message_prompt = HumanMessagePromptTemplate.from_template(
+            batch_human_template or human_template_build_graph_batch
+        )
+        self.batch_chat_prompt = ChatPromptTemplate.from_messages([
+            batch_system_message_prompt,
+            MessagesPlaceholder("chat_history"),
+            batch_human_message_prompt,
+        ])
         
         # 创建处理链
         self.chain = self.chat_prompt | self.llm
+        self.batch_chain = self.batch_chat_prompt | self.llm
         
         # 缓存设置
         self.cache_dir = cache_dir
@@ -73,6 +93,48 @@ class EntityRelationExtractor:
         # 缓存统计
         self.cache_hits = 0
         self.cache_misses = 0
+
+    @staticmethod
+    def _build_empty_result() -> str:
+        """返回空抽取结果，保持上游写图流程兼容。"""
+        return ""
+
+    def _should_skip_chunk(self, text: str) -> bool:
+        """跳过明显低价值 chunk，减少无效 LLM 调用。"""
+        normalized = re.sub(r"\s+", " ", text).strip()
+        if len(normalized) < 40:
+            return True
+
+        chinese_chars = re.findall(r"[\u4e00-\u9fff]", normalized)
+        english_words = re.findall(r"[A-Za-z]{2,}", normalized)
+        informative_units = len(chinese_chars) + len(english_words)
+        if informative_units < 20:
+            return True
+
+        if re.fullmatch(r"[\W\d_]+", normalized):
+            return True
+
+        lower_text = normalized.lower()
+        if lower_text.count("figure") >= 2 and len(normalized) < 300:
+            return True
+        if lower_text.count("table") >= 2 and len(normalized) < 300:
+            return True
+        if normalized.count(".") >= 8 and len(normalized.split()) < 25:
+            return True
+
+        # 对较长的自然语言正文不要轻易跳过。
+        # 之前基于“字符去重率”的判定会把英文教材正文误判为重复文本，
+        # 进而导致整批 chunk 被跳过，表现为 0 个实体 / 0 个关系。
+        word_count = len(normalized.split())
+        if word_count >= 80:
+            return False
+
+        # 改为更稳妥的“词级别多样性”判定，仅用于中短文本的噪声过滤。
+        informative_tokens = re.findall(r"[\u4e00-\u9fff]|[A-Za-z]{2,}", lower_text)
+        unique_token_ratio = len(set(informative_tokens)) / max(len(informative_tokens), 1)
+        if 30 <= len(informative_tokens) <= 120 and unique_token_ratio < 0.2:
+            return True
+        return False
         
     def _generate_cache_key(self, text: str) -> str:
         """
@@ -165,15 +227,28 @@ class EntityRelationExtractor:
             cache_keys = [self._generate_cache_key(''.join(chunk)) for chunk in chunks]
             cached_results = {key: self._load_from_cache(key) for key in cache_keys}
             non_cached_indices = [idx for idx, key in enumerate(cache_keys) if cached_results[key] is None]
+
+            # 对缓存命中的 chunk 也同步推进进度，避免进度条与实际处理量不一致。
+            cached_count = len(chunks) - len(non_cached_indices)
+            if progress_callback and cached_count > 0:
+                for _ in range(cached_count):
+                    progress_callback(chunk_index)
+                    chunk_index += 1
             
             if len(non_cached_indices) > 0:
                 # 只为未缓存的chunks创建任务
                 with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                     # 创建任务字典
-                    future_to_chunk = {
-                        executor.submit(self._process_single_chunk, ''.join(chunks[idx])): idx 
-                        for idx in non_cached_indices
-                    }
+                    future_to_chunk = {}
+                    for idx in non_cached_indices:
+                        chunk_text = ''.join(chunks[idx])
+                        if self._should_skip_chunk(chunk_text):
+                            empty_result = self._build_empty_result()
+                            cached_results[cache_keys[idx]] = empty_result
+                            self._save_to_cache(cache_keys[idx], empty_result)
+                            continue
+                        future = executor.submit(self._process_single_chunk, chunk_text)
+                        future_to_chunk[future] = idx
                     
                     # 处理完成的任务
                     for future in concurrent.futures.as_completed(future_to_chunk):
@@ -189,6 +264,12 @@ class EntityRelationExtractor:
                             
                         except Exception as exc:
                             print(f'Chunk {chunk_idx} 处理异常: {exc}')
+                            if is_non_retryable_llm_error(exc):
+                                print("检测到不可重试的模型调用错误，跳过该 Chunk 的重复重试。")
+                                empty_result = self._build_empty_result()
+                                cached_results[cache_keys[chunk_idx]] = empty_result
+                                self._save_to_cache(cache_keys[chunk_idx], empty_result)
+                                continue
                             # 重试逻辑
                             retry_count = 0
                             while retry_count < 3:
@@ -198,12 +279,20 @@ class EntityRelationExtractor:
                                     cached_results[cache_keys[chunk_idx]] = result
                                     break
                                 except Exception as retry_exc:
+                                    if is_non_retryable_llm_error(retry_exc):
+                                        print("重试阶段检测到不可重试错误，终止当前 Chunk。")
+                                        empty_result = self._build_empty_result()
+                                        cached_results[cache_keys[chunk_idx]] = empty_result
+                                        self._save_to_cache(cache_keys[chunk_idx], empty_result)
+                                        break
                                     print(f'重试失败: {retry_exc}')
                                     retry_count += 1
                                     time.sleep(1)  # 短暂延迟
                             
                             if cached_results[cache_keys[chunk_idx]] is None:
-                                cached_results[cache_keys[chunk_idx]] = ""
+                                empty_result = self._build_empty_result()
+                                cached_results[cache_keys[chunk_idx]] = empty_result
+                                self._save_to_cache(cache_keys[chunk_idx], empty_result)
             
             # 整理结果，保持原始顺序
             ordered_results = [cached_results[key] for key in cache_keys]
@@ -238,14 +327,31 @@ class EntityRelationExtractor:
             
             # 根据平均chunk大小动态调整批处理大小
             dynamic_batch_size = max(1, min(self.batch_size, int(10000 / (avg_chunk_size + 1))))
+            total_batches = max(1, (len(chunks) + dynamic_batch_size - 1) // dynamic_batch_size)
             
             # 按批次处理
             for i in range(0, len(chunks), dynamic_batch_size):
                 batch_chunks = chunks[i:i+dynamic_batch_size]
+                batch_number = i // dynamic_batch_size + 1
                 
                 # 缓存检查
                 batch_keys = [self._generate_cache_key(''.join(chunk)) for chunk in batch_chunks]
                 cached_batch_results = [self._load_from_cache(key) for key in batch_keys]
+                cached_count = sum(1 for item in cached_batch_results if item is not None)
+
+                # 批次开始时先发出一次进度提示，避免长时间停留在 0%。
+                if progress_callback:
+                    progress_callback(
+                        {
+                            "event": "batch_started",
+                            "batch_index": batch_number,
+                            "batch_total": total_batches,
+                            "chunk_start": i,
+                            "chunk_end": i + len(batch_chunks),
+                            "chunk_total": len(chunks),
+                            "cached_count": cached_count,
+                        }
+                    )
                 
                 # 如果所有结果都已缓存，则跳过LLM调用
                 if None not in cached_batch_results:
@@ -256,53 +362,78 @@ class EntityRelationExtractor:
                     continue
                 
                 # 准备批处理输入
-                batch_inputs = []
-                for chunk in batch_chunks:
-                    batch_inputs.append(''.join(chunk))
-                
-                # 使用分隔符合并多个文本块
-                batch_text = f"\n{'-'*50}\n".join(batch_inputs)
+                indexed_batch_inputs: List[Tuple[int, str]] = []
+                batch_results: List[str] = [self._build_empty_result()] * len(batch_chunks)
+                for idx, chunk in enumerate(batch_chunks):
+                    if cached_batch_results[idx] is not None:
+                        batch_results[idx] = cached_batch_results[idx]
+                        continue
+                    chunk_text = ''.join(chunk)
+                    if self._should_skip_chunk(chunk_text):
+                        batch_results[idx] = self._build_empty_result()
+                        self._save_to_cache(batch_keys[idx], batch_results[idx])
+                        continue
+                    indexed_batch_inputs.append((idx, chunk_text))
+
+                if not indexed_batch_inputs:
+                    results.extend(batch_results)
+                    if progress_callback:
+                        for j in range(len(batch_chunks)):
+                            progress_callback(i + j)
+                        progress_callback(
+                            {
+                                "event": "batch_completed",
+                                "batch_index": batch_number,
+                                "batch_total": total_batches,
+                                "chunk_start": i,
+                                "chunk_end": i + len(batch_chunks),
+                                "chunk_total": len(chunks),
+                            }
+                        )
+                    continue
+
+                batch_text = self._format_batch_input(indexed_batch_inputs)
                 
                 try:
-                    # 使用原始提示模板处理批量输入
-                    batch_response = self.chain.invoke({
+                    batch_response = self.batch_chain.invoke({
                         "chat_history": self.chat_history,
                         "entity_types": self.entity_types,
                         "relationship_types": self.relationship_types,
                         "tuple_delimiter": self.tuple_delimiter,
                         "record_delimiter": self.record_delimiter,
-                        "completion_delimiter": self.completion_delimiter,
                         "input_text": batch_text
                     })
-                    
-                    # 解析批量响应
-                    batch_results = self._parse_batch_response(batch_response.content)
-                    
-                    # 处理结果数量不匹配的情况
-                    if len(batch_results) != len(batch_chunks):
-                        # 如果无法正确解析批处理响应，则单独处理每个chunk
-                        # print(f"批处理结果数量不匹配 (期望 {len(batch_chunks)}, 实际 {len(batch_results)}), 将单独处理每个chunk")
-                        batch_results = []
-                        for idx, chunk in enumerate(batch_chunks):
-                            # 检查缓存
-                            cached_result = cached_batch_results[idx]
-                            if cached_result is not None:
-                                batch_results.append(cached_result)
-                            else:
-                                individual_result = self._process_single_chunk(''.join(chunk))
-                                batch_results.append(individual_result)
-                    else:
-                        # 缓存批处理结果
-                        for idx, result in enumerate(batch_results):
-                            if cached_batch_results[idx] is None:  # 只缓存未命中的结果
-                                self._save_to_cache(batch_keys[idx], result)
-                    
+
+                    parsed_batch_results = self._parse_batch_response(batch_response.content)
+                    missing_indices = []
+                    for idx, _ in indexed_batch_inputs:
+                        parsed_result = parsed_batch_results.get(idx)
+                        if parsed_result is None:
+                            missing_indices.append(idx)
+                            continue
+                        batch_results[idx] = parsed_result
+                        self._save_to_cache(batch_keys[idx], parsed_result)
+
+                    for idx in missing_indices:
+                        individual_result = self._process_single_chunk(''.join(batch_chunks[idx]))
+                        batch_results[idx] = individual_result
+
                     results.extend(batch_results)
                 except Exception as e:
                     print(f"批处理错误，切换到单个处理: {e}")
                     for idx, chunk in enumerate(batch_chunks):
                         try:
-                            individual_result = self._process_single_chunk(''.join(chunk))
+                            cached_result = cached_batch_results[idx]
+                            if cached_result is not None:
+                                results.append(cached_result)
+                                continue
+                            chunk_text = ''.join(chunk)
+                            if self._should_skip_chunk(chunk_text):
+                                empty_result = self._build_empty_result()
+                                self._save_to_cache(batch_keys[idx], empty_result)
+                                results.append(empty_result)
+                                continue
+                            individual_result = self._process_single_chunk(chunk_text)
                             results.append(individual_result)
                         except Exception as e2:
                             print(f"单个chunk处理失败: {e2}")
@@ -312,24 +443,47 @@ class EntityRelationExtractor:
                 if progress_callback:
                     for j in range(len(batch_chunks)):
                         progress_callback(i + j)
+                    progress_callback(
+                        {
+                            "event": "batch_completed",
+                            "batch_index": batch_number,
+                            "batch_total": total_batches,
+                            "chunk_start": i,
+                            "chunk_end": i + len(batch_chunks),
+                            "chunk_total": len(chunks),
+                        }
+                    )
             
             file_content.append(results)
         
         return file_contents
 
-    def _parse_batch_response(self, batch_content: str) -> List[str]:
+    def _format_batch_input(self, batch_inputs: List[Tuple[int, str]]) -> str:
+        """构造稳定的批量输入协议，避免模型输出无法拆分。"""
+        blocks = []
+        for idx, text in batch_inputs:
+            blocks.append(f"[CHUNK_START:{idx}]\n{text}\n[CHUNK_END:{idx}]")
+        return "\n\n".join(blocks)
+
+    def _parse_batch_response(self, batch_content: str) -> Dict[int, str]:
         """
-        解析批量响应，将其分割为单独的结果
+        解析批量响应，将其拆分为按 chunk 编号索引的结果。
         
         Args:
             batch_content: 批处理响应内容
             
         Returns:
-            List[str]: 分割后的结果列表
+            Dict[int, str]: chunk 编号到结果文本的映射
         """
-        # 使用分隔符分割响应
-        parts = batch_content.split(f"\n{'-'*50}\n")
-        return [part.strip() for part in parts]
+        pattern = re.compile(
+            r"\[RESULT_START:(\d+)\](.*?)\[RESULT_END:\1\]",
+            flags=re.DOTALL,
+        )
+        parsed_results: Dict[int, str] = {}
+        for match in pattern.finditer(batch_content):
+            chunk_idx = int(match.group(1))
+            parsed_results[chunk_idx] = match.group(2).strip()
+        return parsed_results
     
     @retry(times=3, exceptions=(Exception,), delay=1.0)
     def _process_single_chunk(self, input_text: str) -> str:
@@ -349,6 +503,11 @@ class EntityRelationExtractor:
         cached_result = self._load_from_cache(cache_key)
         if cached_result:
             return cached_result
+
+        if self._should_skip_chunk(input_text):
+            empty_result = self._build_empty_result()
+            self._save_to_cache(cache_key, empty_result)
+            return empty_result
         
         # 未缓存，调用LLM处理
         response = self.chain.invoke({

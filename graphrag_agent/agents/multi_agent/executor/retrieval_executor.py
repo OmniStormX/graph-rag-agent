@@ -84,6 +84,14 @@ class RetrievalExecutor(BaseExecutor):
 
         try:
             structured_output = self._invoke_tool(tool_instance, tool_name, payload)
+            # 对显式返回 `success=false` 的工具结果按失败处理，
+            # 避免下游把工具错误包装成“正常完成”的分析报告。
+            if (
+                isinstance(structured_output, dict)
+                and structured_output.get("success") is False
+            ):
+                success = False
+                error_message = str(structured_output.get("error") or "工具执行失败")
         except Exception as exc:  # noqa: BLE001
             success = False
             error_message = str(exc)

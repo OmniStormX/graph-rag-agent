@@ -1,6 +1,7 @@
-import re
 import html
-from typing import Dict, List, Tuple
+import json
+import re
+from typing import Any, Dict, List, Tuple
 import streamlit as st
 
 def extract_source_ids(answer: str) -> List[str]:
@@ -25,8 +26,8 @@ def extract_source_ids(answer: str) -> List[str]:
     # 去重
     return list(set(source_ids))
 
-def display_source_content(content: str):
-    """更好地显示源内容"""
+def display_source_content(content: Any):
+    """以结构化方式显示源内容。"""
     st.markdown("""
     <style>
     .source-content {
@@ -44,10 +45,116 @@ def display_source_content(content: str):
     }
     </style>
     """, unsafe_allow_html=True)
-    
-    # 将换行符转换为HTML换行，确保格式正确
-    formatted_content = content.replace("\n", "<br>")
+
+    if isinstance(content, dict):
+        title = content.get("title") or "源内容"
+        st.subheader(str(title))
+        if content.get("source_id"):
+            st.caption(f"Source ID: {content.get('source_id')}")
+
+        meta_rows = [
+            {"字段": "来源类型", "值": content.get("source_type") or "-"},
+            {"字段": "文件名", "值": content.get("file_name") or "-"},
+            {"字段": "Chunk ID", "值": content.get("chunk_id") or "-"},
+            {"字段": "Community ID", "值": content.get("community_id") or "-"},
+            {"字段": "块序号", "值": content.get("position") if content.get("position") is not None else "-"},
+            {"字段": "长度", "值": content.get("length") if content.get("length") is not None else "-"},
+            {"字段": "偏移量", "值": content.get("content_offset") if content.get("content_offset") is not None else "-"},
+        ]
+        metric_col1, metric_col2, metric_col3 = st.columns(3)
+        with metric_col1:
+            st.metric("来源类型", str(content.get("source_type") or "-"))
+        with metric_col2:
+            st.metric("块序号", str(content.get("position") if content.get("position") is not None else "-"))
+        with metric_col3:
+            st.metric("文本长度", str(content.get("length") if content.get("length") is not None else "-"))
+
+        with st.expander("查看元信息", expanded=False):
+            st.dataframe(_to_safe_dataframe(meta_rows), use_container_width=True, hide_index=True)
+
+        body_text = content.get("text") or content.get("full_content") or content.get("content") or ""
+        tab_labels = ["正文"]
+        if content.get("summary"):
+            tab_labels.insert(0, "摘要")
+        tab_labels.append("原始响应")
+        tabs = st.tabs(tab_labels)
+
+        tab_offset = 0
+        if content.get("summary"):
+            with tabs[0]:
+                st.markdown(
+                    f"<div class='source-content'>{html.escape(str(content.get('summary'))).replace(chr(10), '<br>')}</div>",
+                    unsafe_allow_html=True,
+                )
+            tab_offset = 1
+
+        with tabs[tab_offset]:
+            if body_text:
+                st.markdown(
+                    f"<div class='source-content'>{html.escape(str(body_text)).replace(chr(10), '<br>')}</div>",
+                    unsafe_allow_html=True,
+                )
+                st.download_button(
+                    "导出当前原文",
+                    data=str(body_text),
+                    file_name=_build_source_export_name(content),
+                    mime="text/plain",
+                    use_container_width=False,
+                )
+            else:
+                st.info("当前来源没有可展示的正文内容。")
+
+        with tabs[tab_offset + 1]:
+            st.code(
+                json.dumps(_normalize_json_payload(content), ensure_ascii=False, indent=2),
+                language="json",
+            )
+
+        if content.get("error"):
+            st.warning(str(content.get("error")))
+        return
+
+    raw_text = str(content or "")
+    formatted_content = html.escape(raw_text).replace("\n", "<br>")
     st.markdown(f'<div class="source-content">{formatted_content}</div>', unsafe_allow_html=True)
+
+
+def _to_safe_dataframe(rows: List[Dict[str, Any]]):
+    """构建适合 Streamlit 展示的 DataFrame。"""
+    import pandas as pd
+
+    normalized_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        normalized_row: Dict[str, Any] = {}
+        for key, value in row.items():
+            if value is None or isinstance(value, (str, int, float, bool)):
+                normalized_row[key] = value
+            else:
+                normalized_row[key] = str(value)
+        normalized_rows.append(normalized_row)
+    return pd.DataFrame(normalized_rows)
+
+
+def _normalize_json_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """将复杂值转换为可稳定序列化的展示结果。"""
+    normalized: Dict[str, Any] = {}
+    for key, value in payload.items():
+        if value is None or isinstance(value, (str, int, float, bool)):
+            normalized[key] = value
+        else:
+            normalized[key] = str(value)
+    return normalized
+
+
+def _build_source_export_name(content: Dict[str, Any]) -> str:
+    """构造导出文件名，便于定位来源。"""
+    if content.get("chunk_id"):
+        return f"source_{content.get('chunk_id')}.txt"
+    if content.get("community_id"):
+        return f"community_{content.get('community_id')}.txt"
+    if content.get("source_id"):
+        return f"source_{content.get('source_id')}.txt"
+    return "source_content.txt"
 
 
 def process_thinking_content(content: str, show_thinking: bool = False):

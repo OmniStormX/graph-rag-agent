@@ -93,6 +93,9 @@ def retry(times: int = 3, exceptions: tuple = (Exception,), delay: float = 1.0):
                 try:
                     return func(*args, **kwargs)
                 except exceptions as e:
+                    # 配额耗尽、鉴权失败等属于确定性错误，继续重试只会放大日志噪音。
+                    if is_non_retryable_llm_error(e):
+                        raise
                     attempt += 1
                     if attempt >= times:
                         raise
@@ -100,6 +103,22 @@ def retry(times: int = 3, exceptions: tuple = (Exception,), delay: float = 1.0):
                     time.sleep(delay)
         return wrapper
     return decorator
+
+
+def is_non_retryable_llm_error(exc: Exception) -> bool:
+    """判断是否为不应重试的 LLM 调用错误。"""
+    error_text = str(exc)
+    non_retryable_markers = [
+        "AllocationQuota.FreeTierOnly",
+        "free tier of the model has been exhausted",
+        "invalid_api_key",
+        "Incorrect API key",
+        "insufficient_quota",
+        "401",
+        "403",
+    ]
+    normalized_text = error_text.lower()
+    return any(marker.lower() in normalized_text for marker in non_retryable_markers)
 
 def get_performance_stats(total_time: float, 
                          time_records: Dict[str, float]) -> Dict[str, str]:

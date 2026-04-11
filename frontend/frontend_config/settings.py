@@ -29,6 +29,7 @@ def _get_env_int(key: str, default: int) -> int:
 # ===== 前端接口与会话配置 =====
 
 API_URL = os.getenv("FRONTEND_API_URL", "http://localhost:8000")  # 后端接口地址
+ADMIN_API_URL = os.getenv("ADMIN_FRONTEND_API_URL", "http://localhost:8001")  # 后台接口地址
 
 DEFAULT_AGENT_TYPE = os.getenv("FRONTEND_DEFAULT_AGENT", "naive_rag_agent")  # 默认Agent
 DEFAULT_DEBUG_MODE = _get_env_bool("FRONTEND_DEFAULT_DEBUG", False)  # 默认是否开启调试

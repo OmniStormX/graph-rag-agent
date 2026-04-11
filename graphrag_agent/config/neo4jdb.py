@@ -26,21 +26,11 @@ class DBConnectionManager:
         self.neo4j_username = NEO4J_CONFIG["username"]
         self.neo4j_password = NEO4J_CONFIG["password"]
         self.max_pool_size = NEO4J_CONFIG["max_pool_size"]
-        
-        # 初始化Neo4j驱动
-        self.driver = GraphDatabase.driver(
-            self.neo4j_uri,
-            auth=(self.neo4j_username, self.neo4j_password),
-            max_connection_pool_size=self.max_pool_size
-        )
-        
-        # 初始化LangChain Neo4j图实例
-        self.graph = Neo4jGraph(
-            url=self.neo4j_uri,
-            username=self.neo4j_username,
-            password=self.neo4j_password,
-            refresh_schema=NEO4J_CONFIG["refresh_schema"],
-        )
+        self.refresh_schema = NEO4J_CONFIG["refresh_schema"]
+
+        # 使用惰性初始化，避免在模块导入阶段因 Neo4j 暂时不可用而导致服务启动失败。
+        self._driver = None
+        self._graph = None
         
         # 连接池配置
         self.session_pool = []
@@ -48,13 +38,48 @@ class DBConnectionManager:
         # 标记为已初始化
         self._initialized = True
     
+    @property
+    def driver(self):
+        """兼容旧代码，按需返回 Neo4j 驱动实例。"""
+        return self.get_driver()
+
+    @property
+    def graph(self):
+        """兼容旧代码，按需返回 LangChain Neo4j 图实例。"""
+        return self.get_graph()
+
+    def _build_driver(self):
+        """创建 Neo4j 原生驱动。"""
+        if not self.neo4j_uri:
+            raise ValueError("未配置 NEO4J_URI")
+        return GraphDatabase.driver(
+            self.neo4j_uri,
+            auth=(self.neo4j_username, self.neo4j_password),
+            max_connection_pool_size=self.max_pool_size
+        )
+
+    def _build_graph(self):
+        """创建 LangChain Neo4j 图实例。"""
+        if not self.neo4j_uri:
+            raise ValueError("未配置 NEO4J_URI")
+        return Neo4jGraph(
+            url=self.neo4j_uri,
+            username=self.neo4j_username,
+            password=self.neo4j_password,
+            refresh_schema=self.refresh_schema,
+        )
+
     def get_driver(self):
         """获取Neo4j驱动实例"""
-        return self.driver
+        if self._driver is None:
+            self._driver = self._build_driver()
+        return self._driver
     
     def get_graph(self):
         """获取LangChain Neo4j图实例"""
-        return self.graph
+        if self._graph is None:
+            self._graph = self._build_graph()
+        return self._graph
     
     def execute_query(self, cypher: str, params: Dict[str, Any] = {}) -> pd.DataFrame:
         """
@@ -67,7 +92,7 @@ class DBConnectionManager:
         返回:
             pd.DataFrame: 查询结果DataFrame
         """
-        return self.driver.execute_query(
+        return self.get_driver().execute_query(
             cypher,
             parameters_=params,
             result_transformer_=Result.to_df
@@ -85,7 +110,7 @@ class DBConnectionManager:
             return self.session_pool.pop()
         else:
             # 创建新会话
-            return self.driver.session()
+            return self.get_driver().session()
     
     def release_session(self, session):
         """
@@ -113,8 +138,10 @@ class DBConnectionManager:
         self.session_pool = []
         
         # 关闭驱动
-        if self.driver:
-            self.driver.close()
+        if self._driver:
+            self._driver.close()
+            self._driver = None
+        self._graph = None
     
     def __enter__(self):
         """上下文管理器入口"""

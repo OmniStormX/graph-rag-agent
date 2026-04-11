@@ -156,7 +156,7 @@ def render_evidence_footnotes(content: str, message_index: int):
                 with st.spinner(f"加载证据 {number} 原文..."):
                     source_data = get_source_content(evidence_id)
                     if source_data and "content" in source_data:
-                        st.session_state.source_content = source_data["content"]
+                        st.session_state.source_content = source_data
                         st.session_state.current_tab = "源内容"
                         st.rerun()
 
@@ -447,7 +447,7 @@ def display_chat_interface():
                                         with st.spinner(f"加载源文本 {display_name}..."):
                                             source_data = get_source_content(source_id)
                                             if source_data and "content" in source_data:
-                                                st.session_state.source_content = source_data["content"]
+                                                st.session_state.source_content = source_data
                                                 st.session_state.current_tab = "源内容"
                                                 st.rerun()
                         

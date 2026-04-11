@@ -10,6 +10,7 @@ import time
 import asyncio
 import json
 import re
+from copy import deepcopy
 
 from graphrag_agent.models.get_models import get_llm_model, get_stream_llm_model, get_embeddings_model
 from graphrag_agent.runtime_logging import emit_runtime_log, shorten_text
@@ -252,6 +253,97 @@ class BaseAgent(ABC):
 
         return await loop.run_in_executor(None, invoke_tool)
 
+    def _serialize_tool_call_arguments(self, tool_call: Dict[str, Any]) -> Dict[str, Any]:
+        """将工具调用参数规范化为 JSON 字符串，兼容严格网关。"""
+        normalized_call = deepcopy(tool_call)
+
+        if "args" in normalized_call and not isinstance(normalized_call.get("args"), str):
+            try:
+                normalized_call["args"] = json.dumps(
+                    normalized_call.get("args", {}),
+                    ensure_ascii=False,
+                )
+            except TypeError:
+                normalized_call["args"] = json.dumps(
+                    {"value": str(normalized_call.get("args"))},
+                    ensure_ascii=False,
+                )
+
+        function_payload = normalized_call.get("function")
+        if isinstance(function_payload, dict):
+            arguments = function_payload.get("arguments")
+            if not isinstance(arguments, str):
+                try:
+                    function_payload["arguments"] = json.dumps(
+                        arguments if arguments is not None else {},
+                        ensure_ascii=False,
+                    )
+                except TypeError:
+                    function_payload["arguments"] = json.dumps(
+                        {"value": str(arguments)},
+                        ensure_ascii=False,
+                    )
+
+        return normalized_call
+
+    def _prepare_messages_for_model(self, messages: Sequence[BaseMessage]) -> List[BaseMessage]:
+        """在模型调用前清洗历史消息，避免 tool_call 参数格式错误。"""
+        prepared_messages: List[BaseMessage] = []
+
+        for message in messages:
+            if not isinstance(message, AIMessage):
+                prepared_messages.append(message)
+                continue
+
+            raw_tool_calls = []
+            if isinstance(message.additional_kwargs, dict):
+                raw_tool_calls = message.additional_kwargs.get("tool_calls", [])
+
+            sanitized_tool_calls: List[Dict[str, Any]] = []
+            if isinstance(raw_tool_calls, list) and raw_tool_calls:
+                sanitized_tool_calls = [
+                    self._serialize_tool_call_arguments(tool_call)
+                    for tool_call in raw_tool_calls
+                    if isinstance(tool_call, dict)
+                ]
+            elif getattr(message, "tool_calls", None):
+                # LangChain 内存中常把 args 保存为 dict，这里显式转回协议要求的字符串。
+                sanitized_tool_calls = [
+                    {
+                        "id": tool_call.get("id", f"tool_call_{index}"),
+                        "type": "function",
+                        "function": {
+                            "name": tool_call.get("name", ""),
+                            "arguments": json.dumps(
+                                tool_call.get("args", {}),
+                                ensure_ascii=False,
+                            ),
+                        },
+                    }
+                    for index, tool_call in enumerate(message.tool_calls)
+                    if isinstance(tool_call, dict)
+                ]
+
+            if sanitized_tool_calls:
+                prepared_messages.append(
+                    AIMessage(
+                        content=message.content,
+                        additional_kwargs={
+                            **(message.additional_kwargs or {}),
+                            "tool_calls": sanitized_tool_calls,
+                        },
+                        response_metadata=message.response_metadata,
+                        name=message.name,
+                        id=message.id,
+                        usage_metadata=getattr(message, "usage_metadata", None),
+                    )
+                )
+                continue
+
+            prepared_messages.append(message)
+
+        return prepared_messages
+
     async def _run_retrieval_step(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """执行统一的工具检索步骤，返回 ToolMessage 列表。"""
         last_message = state["messages"][-1]
@@ -399,9 +491,10 @@ class BaseAgent(ABC):
                 # 替换原始消息
                 messages = messages[:-1] + [enhanced_message]
         
-        # 使用工具处理请求
+        # 使用工具处理请求。
+        # 这里先清洗历史消息中的 tool_call 参数，避免兼容接口拒绝非 JSON 字符串。
         model = self.llm.bind_tools(self.tools)
-        response = model.invoke(messages)
+        response = model.invoke(self._prepare_messages_for_model(messages))
         
         self._log_execution("agent", messages, response)
         return {"messages": [response]}

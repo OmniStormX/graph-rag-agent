@@ -81,7 +81,19 @@ class EntityIndexManager(BaseIndexer):
         
         if not entities:
             print("没有找到需要处理的实体节点")
-            return None
+            try:
+                # 即使没有新实体需要计算 embedding，也要确保向量索引仍然存在。
+                vector_store = Neo4jVector.from_existing_graph(
+                    self.embeddings,
+                    node_label=node_label,
+                    text_node_properties=text_properties,
+                    embedding_node_property=embedding_property
+                )
+                print("成功连接到现有实体向量索引")
+                return vector_store
+            except Exception as e:
+                print(f"连接到实体向量索引时出错: {e}")
+                return None
             
         print(f"开始为 {len(entities)} 个实体生成embeddings")
         

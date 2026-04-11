@@ -1,6 +1,6 @@
 import re
 import concurrent.futures
-from typing import List, Set
+from typing import List, Set, Optional, Tuple
 from langchain_community.graphs import Neo4jGraph
 from langchain_core.documents import Document
 from langchain_community.graphs.graph_document import GraphDocument, Node, Relationship
@@ -32,6 +32,92 @@ class GraphWriter:
         
         # 用于跟踪已经处理的节点，减少重复操作
         self.processed_nodes: Set[str] = set()
+
+    def _normalize_extraction_result(self, result: str) -> str:
+        """清洗 LLM 抽取结果，提升正则解析的容错性。"""
+        normalized = str(result or "").strip()
+        if not normalized:
+            return ""
+
+        # 去掉常见 Markdown 包裹，避免代码块影响解析。
+        normalized = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", normalized)
+        normalized = re.sub(r"\s*```$", "", normalized)
+        normalized = normalized.replace("\r\n", "\n").replace("\r", "\n")
+        return normalized
+
+    @staticmethod
+    def _strip_field(value: str) -> str:
+        """去除字段外围噪声，兼容引号和 Markdown 标记。"""
+        cleaned = str(value or "").strip()
+        cleaned = cleaned.strip("*").strip()
+        if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in {'"', "'"}:
+            cleaned = cleaned[1:-1].strip()
+        return cleaned
+
+    def _extract_tuple_records(self, normalized_result: str) -> List[str]:
+        """从结果中提取完整元组，兼容描述中的括号和换行。"""
+        if not normalized_result:
+            return []
+
+        tuple_records: List[str] = []
+        start_pattern = re.compile(r'\(\s*"?(entity|relationship)"?\s*:', flags=re.IGNORECASE)
+        search_pos = 0
+
+        while True:
+            match = start_pattern.search(normalized_result, search_pos)
+            if not match:
+                break
+
+            start_index = match.start()
+            depth = 0
+            end_index: Optional[int] = None
+            for idx in range(start_index, len(normalized_result)):
+                char = normalized_result[idx]
+                if char == "(":
+                    depth += 1
+                elif char == ")":
+                    depth -= 1
+                    if depth == 0:
+                        end_index = idx
+                        break
+
+            if end_index is None:
+                # 解析到不完整元组时直接终止，避免死循环。
+                break
+
+            tuple_records.append(normalized_result[start_index:end_index + 1].strip())
+            search_pos = end_index + 1
+
+        return tuple_records
+
+    def _parse_tuple_record(self, tuple_record: str) -> Optional[Tuple[str, List[str]]]:
+        """解析单条元组记录，返回记录类型与字段列表。"""
+        content = tuple_record.strip()
+        if not content.startswith("(") or not content.endswith(")"):
+            return None
+
+        content = content[1:-1].strip()
+        content = content.lstrip("*").strip()
+        parts = re.split(r"\s*:\s*", content, maxsplit=5)
+        if not parts:
+            return None
+
+        record_type = self._strip_field(parts[0]).lower()
+        if record_type == "entity":
+            parts = re.split(r"\s*:\s*", content, maxsplit=3)
+            if len(parts) != 4:
+                return None
+            fields = [self._strip_field(part) for part in parts[1:]]
+            return record_type, fields
+
+        if record_type == "relationship":
+            parts = re.split(r"\s*:\s*", content, maxsplit=5)
+            if len(parts) != 6:
+                return None
+            fields = [self._strip_field(part) for part in parts[1:]]
+            return record_type, fields
+
+        return None
         
     def convert_to_graph_document(self, chunk_id: str, input_text: str, result: str) -> GraphDocument:
         """
@@ -45,69 +131,85 @@ class GraphWriter:
         Returns:
             GraphDocument: 转换后的图文档对象
         """
-        node_pattern = re.compile(r'\("entity" : "(.+?)" : "(.+?)" : "(.+?)"\)')
-        relationship_pattern = re.compile(r'\("relationship" : "(.+?)" : "(.+?)" : "(.+?)" : "(.+?)" : (.+?)\)')
-
+        normalized_result = self._normalize_extraction_result(result)
         nodes = {}
         relationships = []
+        tuple_records = self._extract_tuple_records(normalized_result)
 
-        # 使用高效的正则匹配处理
+        # 使用稳健的元组扫描和字段拆分，兼容是否带引号、Markdown 噪声和多行描述。
         try:
-            # 解析节点 - 使用缓存提高效率
-            for match in node_pattern.findall(result):
-                node_id, node_type, description = match
-                # 检查节点缓存
-                if node_id in self.node_cache:
-                    nodes[node_id] = self.node_cache[node_id]
-                elif node_id not in nodes:
-                    new_node = Node(
-                        id=node_id,
-                        type=node_type,
-                        properties={'description': description}
-                    )
-                    nodes[node_id] = new_node
-                    self.node_cache[node_id] = new_node
+            for tuple_record in tuple_records:
+                parsed_record = self._parse_tuple_record(tuple_record)
+                if not parsed_record:
+                    continue
 
-            # 解析关系
-            for match in relationship_pattern.findall(result):
-                source_id, target_id, rel_type, description, weight = match
-                # 确保源节点存在，先检查缓存
-                if source_id not in nodes:
-                    if source_id in self.node_cache:
-                        nodes[source_id] = self.node_cache[source_id]
-                    else:
+                record_type, fields = parsed_record
+                if record_type == "entity":
+                    node_id, node_type, description = fields
+                    description = " ".join(str(description).split())
+
+                    if not node_id or not node_type:
+                        continue
+
+                    if node_id in self.node_cache:
+                        nodes[node_id] = self.node_cache[node_id]
+                    elif node_id not in nodes:
                         new_node = Node(
-                            id=source_id,
-                            type="未知",
-                            properties={'description': 'No additional data'}
+                            id=node_id,
+                            type=node_type,
+                            properties={'description': description}
                         )
-                        nodes[source_id] = new_node
-                        self.node_cache[source_id] = new_node
-                        
-                # 确保目标节点存在，先检查缓存
-                if target_id not in nodes:
-                    if target_id in self.node_cache:
-                        nodes[target_id] = self.node_cache[target_id]
-                    else:
-                        new_node = Node(
-                            id=target_id,
-                            type="未知",
-                            properties={'description': 'No additional data'}
+                        nodes[node_id] = new_node
+                        self.node_cache[node_id] = new_node
+                    continue
+
+                if record_type == "relationship":
+                    source_id, target_id, rel_type, description, weight = fields
+                    description = " ".join(str(description).split())
+
+                    if not source_id or not target_id or not rel_type:
+                        continue
+
+                    if source_id not in nodes:
+                        if source_id in self.node_cache:
+                            nodes[source_id] = self.node_cache[source_id]
+                        else:
+                            new_node = Node(
+                                id=source_id,
+                                type="未知",
+                                properties={'description': 'No additional data'}
+                            )
+                            nodes[source_id] = new_node
+                            self.node_cache[source_id] = new_node
+
+                    if target_id not in nodes:
+                        if target_id in self.node_cache:
+                            nodes[target_id] = self.node_cache[target_id]
+                        else:
+                            new_node = Node(
+                                id=target_id,
+                                type="未知",
+                                properties={'description': 'No additional data'}
+                            )
+                            nodes[target_id] = new_node
+                            self.node_cache[target_id] = new_node
+
+                    try:
+                        weight_value = float(weight)
+                    except (TypeError, ValueError):
+                        weight_value = 1.0
+
+                    relationships.append(
+                        Relationship(
+                            source=nodes[source_id],
+                            target=nodes[target_id],
+                            type=rel_type,
+                            properties={
+                                "description": description,
+                                "weight": weight_value
+                            }
                         )
-                        nodes[target_id] = new_node
-                        self.node_cache[target_id] = new_node
-                    
-                relationships.append(
-                    Relationship(
-                        source=nodes[source_id],
-                        target=nodes[target_id],
-                        type=rel_type,
-                        properties={
-                            "description": description,
-                            "weight": float(weight)
-                        }
                     )
-                )
         except Exception as e:
             print(f"解析文本时出错: {e}")
             # 返回空的GraphDocument而不是引发异常
@@ -118,6 +220,14 @@ class GraphWriter:
                     page_content=input_text,
                     metadata={"chunk_id": chunk_id, "error": str(e)}
                 )
+            )
+
+        if not nodes and not relationships and normalized_result:
+            # 仅在结果非空但未解析到结构化记录时输出简短诊断，便于排查提示词/格式问题。
+            preview = normalized_result[:300].replace("\n", "\\n")
+            print(
+                f"Chunk {chunk_id} 未解析出实体或关系，"
+                f"扫描到 {len(tuple_records)} 条候选元组，结果预览: {preview}"
             )
 
         # 创建并返回GraphDocument对象

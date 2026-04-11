@@ -1,12 +1,26 @@
-import tempfile
 import os
+import tempfile
 import streamlit as st
-from pyvis.network import Network
 import streamlit.components.v1 as components
-from frontend_config.settings import KG_COLOR_PALETTE, NODE_TYPE_COLORS
+from pyvis.network import Network
+
+from frontend_config.settings import NODE_TYPE_COLORS
+
+
+ADMIN_KG_PALETTE = [
+    "#0071E3",
+    "#1D1D1F",
+    "#2A6DD8",
+    "#4C596A",
+    "#0F9D58",
+    "#FF9F0A",
+    "#636366",
+    "#8E8E93",
+]
+
 
 def visualize_knowledge_graph(kg_data, focus_node_id=None):
-    """使用pyvis可视化知识图谱 - 动态节点类型和颜色，支持Neo4j式交互"""
+    """使用 PyVis 可视化知识图谱。"""
     if not kg_data or "nodes" not in kg_data or "links" not in kg_data:
         st.warning("无法获取知识图谱数据")
         return
@@ -15,15 +29,15 @@ def visualize_knowledge_graph(kg_data, focus_node_id=None):
         st.info("没有找到相关的实体和关系")
         return
     
-    # 添加图表设置控制 - 增加交互说明
+    # 这里保留图谱控制区，方便后台用户在大图谱场景下调优展示密度。
     with st.expander("图谱显示设置与交互说明", expanded=False):
         st.markdown("""
         ### 交互说明
         - **双击节点**: 聚焦查看该节点及其直接相连的节点和关系
-        - **右键节点**: 打开上下文菜单，提供更多操作
-        - **单击空白处**: 重置图谱，显示所有节点
-        - **使用控制面板**: 右上角的控制面板提供重置和返回上一步功能
-        
+        - **右键节点**: 打开上下文菜单，提供聚焦、隐藏和查看详情操作
+        - **单击空白处**: 重置图谱，恢复完整视图
+        - **控制面板**: 右上角面板提供重置和返回上一步功能
+
         ### 显示设置
         """)
         
@@ -67,29 +81,40 @@ def visualize_knowledge_graph(kg_data, focus_node_id=None):
             "gravity": st.session_state.kg_display_settings["gravity"]
         }
     
-    # 创建网络图 - 修改背景为白色
-    net = Network(height="600px", width="100%", bgcolor="#FFFFFF", font_color="#333333", directed=True)
+    directed = bool(kg_data.get("directed", True))
+
+    # 使用浅色背景与深色文本，和后台主界面保持一致的管理台观感。
+    net = Network(
+        height="600px",
+        width="100%",
+        bgcolor="#FBFBFD",
+        font_color="#1D1D1F",
+        directed=directed,
+    )
     
     # 增强配置 - 为Neo4j式交互添加配置
     net.set_options("""
     {
-      "physics": {
-        "enabled": %s,
-        "barnesHut": {
-          "gravitationalConstant": %d,
-          "centralGravity": 0.5,
-          "springLength": %d,
-          "springConstant": 0.04,
-          "damping": 0.15,
-          "avoidOverlap": 0.1
-        },
-        "solver": "barnesHut",
-        "stabilization": {
-          "enabled": true,
-          "iterations": 1000,
-          "updateInterval": 100,
-          "onlyDynamicEdges": false,
-          "fit": true
+          "configure": {
+            "enabled": false
+          },
+          "physics": {
+            "enabled": %s,
+            "barnesHut": {
+              "gravitationalConstant": %d,
+              "centralGravity": 0.35,
+              "springLength": %d,
+              "springConstant": 0.03,
+              "damping": 0.22,
+              "avoidOverlap": 0.18
+            },
+            "solver": "barnesHut",
+            "stabilization": {
+              "enabled": true,
+              "iterations": 700,
+              "updateInterval": 100,
+              "onlyDynamicEdges": false,
+              "fit": true
         }
       },
       "interaction": {
@@ -141,15 +166,15 @@ def visualize_knowledge_graph(kg_data, focus_node_id=None):
                         comm_id = int(comm_id_str)
                     
                     # 确保使用一致的社区颜色映射
-                    color_index = (comm_id - 1) % len(KG_COLOR_PALETTE) if comm_id > 0 else 0
-                    group_colors[group] = KG_COLOR_PALETTE[color_index]
+                    color_index = (comm_id - 1) % len(ADMIN_KG_PALETTE) if comm_id > 0 else 0
+                    group_colors[group] = ADMIN_KG_PALETTE[color_index]
                 except (ValueError, TypeError):
                     # 转换失败，使用默认分配
-                    group_colors[group] = KG_COLOR_PALETTE[palette_index % len(KG_COLOR_PALETTE)]
+                    group_colors[group] = ADMIN_KG_PALETTE[palette_index % len(ADMIN_KG_PALETTE)]
                     palette_index += 1
             else:
                 # 普通类型按序分配颜色
-                group_colors[group] = KG_COLOR_PALETTE[palette_index % len(KG_COLOR_PALETTE)]
+                group_colors[group] = ADMIN_KG_PALETTE[palette_index % len(ADMIN_KG_PALETTE)]
                 palette_index += 1
     
     # 添加节点，使用更现代的样式并增强交互体验
@@ -158,14 +183,17 @@ def visualize_knowledge_graph(kg_data, focus_node_id=None):
         label = node.get("label", node_id)
         group = node.get("group", "Unknown")
         description = node.get("description", "")
+        is_highlighted = bool(node.get("highlighted"))
         
         # 根据节点组类型设置颜色
-        color = group_colors.get(group, KG_COLOR_PALETTE[0])  # 默认使用第一个颜色
+        color = group_colors.get(group, ADMIN_KG_PALETTE[0])
         
         # 添加节点信息提示，改进格式
         title = f"{label}" + (f": {description}" if description else "")
         
         # 添加带有阴影和边框的节点 - 增加hover和select效果
+        current_node_size = int(node.get("size") or node_size)
+
         net.add_node(
             node_id, 
             label=label, 
@@ -182,10 +210,12 @@ def visualize_knowledge_graph(kg_data, focus_node_id=None):
                     "border": "#000000"
                 }
             }, 
-            size=node_size, 
-            font={"color": "#ffffff", "size": 14, "face": "Arial"},
-            shadow={"enabled": True, "color": "rgba(0,0,0,0.2)", "size": 3},
-            borderWidth=2,
+            size=current_node_size,
+            font={"color": "#ffffff", "size": 14, "face": "Helvetica"},
+            shadow={"enabled": True, "color": "rgba(0,0,0,0.16)", "size": 8},
+            borderWidth=4 if is_highlighted else 2,
+            borderWidthSelected=5 if is_highlighted else 3,
+            borderColor="#0071E3" if is_highlighted else "#ffffff",
             # 添加自定义数据用于交互
             group=group,
             description=description
@@ -197,30 +227,35 @@ def visualize_knowledge_graph(kg_data, focus_node_id=None):
         target = link["target"]
         label = link.get("label", "")
         weight = link.get("weight", 1)
+        is_highlighted = bool(link.get("highlighted"))
+        edge_id = link.get("edge_id")
         
         # 根据权重设置线的粗细和不透明度
         width = edge_width * min(1 + (weight * 0.2), 3)
+        if is_highlighted:
+            width = max(width * 1.8, edge_width + 3)
         
         # 使用弯曲的箭头和平滑的线条
         smooth = {"enabled": True, "type": "dynamic", "roundness": 0.5}
         
-        title = label
+        title = link.get("title", label)
         
         # 添加带有阴影的边 - 增加hover和select效果
         net.add_edge(
             source, 
             target, 
+            id=edge_id,
             title=title, 
             label=label, 
             width=width, 
             smooth=smooth,
             color={
-                "color": "#999999", 
-                "highlight": "#666666",
-                "hover": "#666666"
+                "color": "#0071E3" if is_highlighted else "#8E8E93",
+                "highlight": "#0066CC" if is_highlighted else "#4C596A",
+                "hover": "#0066CC" if is_highlighted else "#4C596A"
             },
-            shadow={"enabled": True, "color": "rgba(0,0,0,0.1)"},
-            selectionWidth=2,
+            shadow={"enabled": True, "color": "rgba(0,0,0,0.08)"},
+            selectionWidth=4 if is_highlighted else 2,
             # 添加自定义数据用于交互
             weight=weight,
             arrowStrikethrough=False
@@ -272,10 +307,12 @@ def visualize_knowledge_graph(kg_data, focus_node_id=None):
     # 显示图例，使用更现代的样式
     st.write("### 图例")
 
-    # 按特定优先级顺序显示图例
+    # 按特定优先级顺序显示图例。
+    # 优先展示业务标签，系统保留标签（如 __Entity__）放到最后。
     priority_groups = ["Center", "Source", "Target", "Common"]
     community_groups = []
     other_groups = []
+    system_groups = []
 
     # 对组类型进行分类
     for group in group_colors.keys():
@@ -283,12 +320,15 @@ def visualize_knowledge_graph(kg_data, focus_node_id=None):
             continue  # 这些将单独处理
         elif isinstance(group, str) and "Community" in group:
             community_groups.append(group)
+        elif isinstance(group, str) and group.startswith("__"):
+            system_groups.append(group)
         else:
             other_groups.append(group)
 
     # 排序以确保一致的显示顺序
     community_groups.sort()
     other_groups.sort()
+    system_groups.sort()
 
     # 合并所有组，保持优先顺序
     all_groups = []
@@ -297,6 +337,7 @@ def visualize_knowledge_graph(kg_data, focus_node_id=None):
             all_groups.append(group)
     all_groups.extend(other_groups)
     all_groups.extend(community_groups)
+    all_groups.extend(system_groups)
 
     # 创建多列显示，使用更美观的图例样式
     cols = st.columns(3)

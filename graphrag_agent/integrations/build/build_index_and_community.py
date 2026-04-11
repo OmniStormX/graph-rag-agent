@@ -1,7 +1,7 @@
 import os
 import time
 import psutil
-from typing import Dict, Any
+from typing import Callable, Dict, Any, Optional
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
 from rich.table import Table
@@ -35,10 +35,15 @@ class IndexCommunityBuilder:
     5. 社区摘要生成
     """
     
-    def __init__(self):
-        """初始化索引和社区构建器"""
+    def __init__(self, progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None):
+        """初始化索引和社区构建器。
+
+        Args:
+            progress_callback: 外部进度回调，用于同步后台构建状态。
+        """
         # 初始化终端界面
         self.console = Console()
+        self.progress_callback = progress_callback
         
         # 阶段性能统计 - 确保在_initialize_components之前定义
         self.performance_stats = {
@@ -58,6 +63,18 @@ class IndexCommunityBuilder:
         # 初始化组件
         self._initialize_components()
 
+    def _emit_progress(self, message: str, progress: float, stage: str) -> None:
+        """发送结构化进度事件。"""
+        if not self.progress_callback:
+            return
+        self.progress_callback(
+            {
+                "stage": stage,
+                "message": message,
+                "progress": progress,
+            }
+        )
+
     def _create_progress(self):
         """创建进度显示器"""
         return Progress(
@@ -71,6 +88,7 @@ class IndexCommunityBuilder:
     def _initialize_components(self):
         """初始化所有必要的组件"""
         init_start = time.time()
+        self._emit_progress("初始化索引与社区构建组件", 0.63, "index_init")
         
         with self._create_progress() as progress:
             task = progress.add_task("[cyan]初始化组件...", total=4)
@@ -115,6 +133,7 @@ class IndexCommunityBuilder:
             progress.advance(task)
         
         self.performance_stats["初始化"] = time.time() - init_start
+        self._emit_progress("索引与社区组件初始化完成", 0.66, "index_init")
 
     def _display_stage_header(self, title: str):
         """显示处理阶段的标题"""
@@ -150,12 +169,14 @@ class IndexCommunityBuilder:
             # 1. 创建实体索引
             index_start = time.time()
             self.console.print("[cyan]正在创建实体索引...[/cyan]")
+            self._emit_progress("正在创建实体索引", 0.68, "entity_index")
             
             vector_store = self.index_manager.create_entity_index()
             if not vector_store:
                 self.console.print("[yellow]警告: 实体索引创建可能不完整[/yellow]")
             
             self.performance_stats["索引创建"] = time.time() - index_start
+            self._emit_progress("实体索引创建完成", 0.72, "entity_index")
             
             # 显示嵌入计算性能
             embedding_time = getattr(self.index_manager, 'embedding_time', 0)
@@ -169,10 +190,16 @@ class IndexCommunityBuilder:
             # 2. 检测和合并相似实体
             similar_start = time.time()
             self.console.print("[cyan]正在检测相似实体...[/cyan]")
+            self._emit_progress("正在检测相似实体", 0.74, "similar_detection")
             
             duplicates = self.entity_detector.process_entities()
             
             self.performance_stats["相似实体检测"] = time.time() - similar_start
+            self._emit_progress(
+                f"相似实体检测完成，候选组数 {len(duplicates)}",
+                0.78,
+                "similar_detection",
+            )
             
             # 显示相似实体检测性能统计
             projection_time = getattr(self.entity_detector, 'projection_time', 0)
@@ -190,10 +217,12 @@ class IndexCommunityBuilder:
             # 3. 执行实体合并
             merge_start = time.time()
             self.console.print("[cyan]正在合并相似实体...[/cyan]")
+            self._emit_progress("正在合并相似实体", 0.80, "entity_merge")
             
             merged_count = self.entity_merger.process_duplicates(duplicates)
             
             self.performance_stats["实体合并"] = time.time() - merge_start
+            self._emit_progress("实体合并完成", 0.83, "entity_merge")
             
             # 显示实体合并性能统计
             llm_time = getattr(self.entity_merger, 'llm_time', 0)
@@ -215,10 +244,12 @@ class IndexCommunityBuilder:
             # 4. 实体质量提升（消歧和对齐）
             quality_start = time.time()
             self.console.print("[cyan]正在进行实体消歧和对齐...[/cyan]")
+            self._emit_progress("正在进行实体消歧和对齐", 0.84, "entity_quality")
             
             quality_result = self.quality_processor.process()
             
             self.performance_stats["实体质量提升"] = time.time() - quality_start
+            self._emit_progress("实体质量提升完成", 0.87, "entity_quality")
             
             self._display_results_table(
                 "实体质量提升结果",
@@ -232,6 +263,7 @@ class IndexCommunityBuilder:
             # 5. 社区检测
             community_start = time.time()
             self.console.print("[cyan]正在执行社区检测...[/cyan]")
+            self._emit_progress("正在执行社区检测", 0.88, "community_detection")
 
             # 使用工厂类创建检测器
             detector = CommunityDetectorFactory.create(
@@ -242,6 +274,7 @@ class IndexCommunityBuilder:
             community_results = detector.process()
 
             self.performance_stats["社区检测"] = time.time() - community_start
+            self._emit_progress("社区检测完成", 0.91, "community_detection")
 
             self.console.print(f"[blue]社区检测完成，耗时: {self.performance_stats['社区检测']:.2f}秒[/blue]")
             if community_results and community_results.get('status') == 'success':
@@ -251,6 +284,7 @@ class IndexCommunityBuilder:
             # 6. 生成社区摘要
             summary_start = time.time()
             self.console.print("[cyan]正在生成社区摘要...[/cyan]")
+            self._emit_progress("正在生成社区摘要", 0.92, "community_summary")
 
             # 使用摘要工厂类
             summarizer = CommunitySummarizerFactory.create_summarizer(
@@ -260,6 +294,7 @@ class IndexCommunityBuilder:
             summaries = summarizer.process_communities()
 
             self.performance_stats["社区摘要"] = time.time() - summary_start
+            self._emit_progress("社区摘要生成完成", 0.95, "community_summary")
 
             self._display_results_table(
                 "社区摘要结果",
@@ -270,6 +305,7 @@ class IndexCommunityBuilder:
             )
             
             self.console.print("[green]索引和社区构建完成[/green]")
+            self._emit_progress("索引和社区构建完成", 0.96, "index_completed")
             
             # 显示性能统计摘要
             performance_table = Table(title="性能统计摘要")
@@ -289,6 +325,7 @@ class IndexCommunityBuilder:
             
         except Exception as e:
             self.console.print(f"[red]索引和社区构建失败: {str(e)}[/red]")
+            self._emit_progress(f"索引和社区构建失败: {str(e)}", 1.0, "failed")
             raise
 
     def process(self):

@@ -7,6 +7,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from graphrag_agent.agents.base import BaseAgent
 from graphrag_agent.config.prompts import NAIVE_PROMPT, NAIVE_RAG_HUMAN_PROMPT
 from graphrag_agent.config.settings import response_type
+from graphrag_agent.search.tool.fluid_property_tool import FluidPropertyTool
 from graphrag_agent.search.tool.naive_search_tool import NaiveSearchTool
 
 
@@ -15,12 +16,13 @@ class NaiveRagAgent(BaseAgent):
 
     def __init__(self):
         self.search_tool = NaiveSearchTool()
+        self.fluid_property_tool = FluidPropertyTool()
         self.cache_dir = "./cache/naive_agent"
         super().__init__(cache_dir=self.cache_dir)
 
     def _setup_tools(self) -> List:
         """设置工具。"""
-        return [self.search_tool.get_tool()]
+        return [self.search_tool.get_tool(), self.fluid_property_tool.get_tool()]
 
     def _add_retrieval_edges(self, workflow):
         """添加从检索到生成的边。"""

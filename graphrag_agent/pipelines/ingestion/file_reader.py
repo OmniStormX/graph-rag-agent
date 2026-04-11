@@ -1,7 +1,13 @@
 import codecs
 import os
+import re
 from typing import List, Tuple, Dict, Optional
-import PyPDF2
+
+try:
+    import PyPDF2
+except ImportError:  # pragma: no cover - 依赖缺失时在运行阶段给出明确提示
+    PyPDF2 = None
+
 from docx import Document
 import csv
 import json
@@ -189,22 +195,131 @@ class FileReader:
             
     def _read_pdf(self, file_path: str) -> str:
         """读取PDF文件"""
+        if PyPDF2 is None:
+            raise ImportError(
+                "读取 PDF 需要安装 PyPDF2，请先执行 `pip install PyPDF2`。"
+            )
         try:
-            text = ""
+            cleaned_pages = []
             with open(file_path, 'rb') as file:
                 pdf_reader = PyPDF2.PdfReader(file)
                 for page_num in range(len(pdf_reader.pages)):
                     try:
                         page = pdf_reader.pages[page_num]
                         page_text = page.extract_text() or ""
-                        text += page_text + "\n\n"
+                        cleaned_pages.append(
+                            self._clean_pdf_text(page_text, page_num=page_num + 1)
+                        )
                     except Exception as e:
                         print(f"读取PDF文件 {os.path.basename(file_path)} 的第 {page_num+1} 页失败: {str(e)}")
-                        text += f"[第 {page_num+1} 页无法读取]\n\n"
-            return text
+                        cleaned_pages.append(f"[第 {page_num+1} 页无法读取]")
+            return "\n\n".join(page for page in cleaned_pages if page.strip())
         except Exception as e:
             print(f"读取PDF文件 {os.path.basename(file_path)} 失败: {str(e)}")
             return f"[无法读取PDF文件内容: {str(e)}]"
+
+    def _clean_pdf_text(self, text: str, page_num: int) -> str:
+        """清洗 PDF 抽取文本，尽量减少版式噪声。
+
+        说明：
+            英文教材经常带有页眉页脚、排版断词和多余换行。这里在不引入 OCR 的前提下，
+            做一层轻量清洗，尽量提升后续分块的信息密度。
+        """
+        if not text:
+            return ""
+
+        normalized = text.replace("\u00a0", " ").replace("\r", "\n")
+        normalized = normalized.replace("\x0c", "\n")
+
+        # 修复英文排版造成的断词，如 "thermody - namics"。
+        normalized = re.sub(r"([A-Za-z])\s*-\s*\n\s*([A-Za-z])", r"\1\2", normalized)
+        normalized = re.sub(r"([A-Za-z])\s*-\s+([A-Za-z])", r"\1\2", normalized)
+        normalized = re.sub(r"([A-Za-z])-\n([A-Za-z])", r"\1\2", normalized)
+
+        cleaned_lines = []
+        for raw_line in normalized.splitlines():
+            line = raw_line.strip()
+            if not line:
+                cleaned_lines.append("")
+                continue
+
+            if self._should_skip_pdf_line(line, page_num):
+                continue
+
+            normalized_line = self._normalize_pdf_line(line)
+            if normalized_line:
+                cleaned_lines.append(normalized_line)
+
+        # 合并单个换行，尽量恢复段落连续性；连续空行保留为段落边界。
+        paragraphs = []
+        current_paragraph = []
+        for line in cleaned_lines:
+            if not line:
+                if current_paragraph:
+                    paragraphs.append(self._merge_pdf_paragraph_lines(current_paragraph))
+                    current_paragraph = []
+                continue
+            current_paragraph.append(line)
+        if current_paragraph:
+            paragraphs.append(self._merge_pdf_paragraph_lines(current_paragraph))
+
+        return "\n\n".join(paragraph for paragraph in paragraphs if paragraph.strip())
+
+    def _should_skip_pdf_line(self, line: str, page_num: int) -> bool:
+        """判断当前 PDF 行是否属于低价值版式噪声。"""
+        line_lower = line.lower()
+
+        # 过滤纯页码和常见排版标记。
+        if re.fullmatch(r"\d+", line):
+            return True
+        if re.fullmatch(rf"{page_num}", line):
+            return True
+        if ".indd" in line_lower:
+            return True
+        if "final pdf to printer" in line_lower:
+            return True
+        if re.fullmatch(r"\d+\s+\d{2}/\d{2}/\d{2}\s+\d{2}:\d{2}\s+[ap]m", line_lower):
+            return True
+
+        # 过滤常见页眉页脚和排版遗留内容。
+        if re.fullmatch(r"chapter\s+\d+", line_lower):
+            return True
+        if re.fullmatch(r"introduction and basic concepts(?: and units)?", line_lower):
+            return True
+        if re.fullmatch(r"basic concepts(?: and units)?", line_lower):
+            return True
+
+        # 过滤明显无语义的图页残片。
+        if len(line) <= 8 and re.fullmatch(r"[\W_]+", line):
+            return True
+
+        return False
+
+    def _normalize_pdf_line(self, line: str) -> str:
+        """规范化 PDF 单行文本，减少后续断句噪声。"""
+        normalized_line = re.sub(r"\s+", " ", line).strip()
+
+        # 去掉教材中常见的 Unicode 连字符残留。
+        normalized_line = normalized_line.replace("–", "-").replace("—", "-")
+
+        return normalized_line
+
+    def _merge_pdf_paragraph_lines(self, lines: List[str]) -> str:
+        """合并 PDF 段落内的换行。"""
+        merged = ""
+        for line in lines:
+            if not merged:
+                merged = line
+                continue
+
+            # 中文连续句默认直接拼接；英文与数字则补空格，避免单词挤在一起。
+            if re.search(r"[\u4e00-\u9fff]$", merged) and re.match(r"^[\u4e00-\u9fff]", line):
+                merged += line
+            elif re.search(r"[A-Za-z0-9,;:]$", merged) and re.match(r"^[A-Za-z0-9(]", line):
+                merged += " " + line
+            else:
+                merged += line
+        return merged
     
     def _read_markdown(self, file_path: str) -> str:
         """读取Markdown文件"""

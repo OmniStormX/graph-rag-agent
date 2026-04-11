@@ -1,8 +1,10 @@
 import uvicorn
 from fastapi import FastAPI
+from graphrag_agent.config.settings import GRAPH_ADMIN_ENABLED
 from routers import api_router
 from server_config.database import get_db_manager
 from server_config.settings import UVICORN_CONFIG
+from services.admin_metadata_service import metadata_service
 from services.agent_service import agent_manager
 
 # 初始化 FastAPI 应用
@@ -14,6 +16,13 @@ app.include_router(api_router)
 # 获取数据库连接
 db_manager = get_db_manager()
 driver = db_manager.driver
+
+
+@app.on_event("startup")
+def startup_event():
+    """应用启动时初始化后台元数据表。"""
+    if GRAPH_ADMIN_ENABLED and metadata_service.available:
+        metadata_service.initialize_schema()
 
 
 @app.on_event("shutdown")

@@ -1,7 +1,7 @@
 import time
 import os
 import psutil
-from typing import Dict, Any, List, Tuple
+from typing import Callable, Dict, Any, List, Optional, Tuple
 
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
@@ -10,9 +10,11 @@ from rich.panel import Panel
 from rich.text import Text
 
 from graphrag_agent.models.get_models import get_llm_model, get_embeddings_model
-from graphrag_agent.config.prompts import (
+from graphrag_agent.config.prompts.graph_prompts import (
     system_template_build_graph,
-    human_template_build_graph
+    human_template_build_graph,
+    system_template_build_graph_batch,
+    human_template_build_graph_batch,
 )
 from graphrag_agent.config.settings import (
     entity_types,
@@ -21,7 +23,7 @@ from graphrag_agent.config.settings import (
     FILES_DIR,
     CHUNK_SIZE,
     OVERLAP,
-    MAX_WORKERS, BATCH_SIZE,
+    MAX_WORKERS, BATCH_SIZE, LLM_BATCH_SIZE,
 )
 from graphrag_agent.config.neo4jdb import get_db_manager
 from graphrag_agent.pipelines.ingestion.document_processor import DocumentProcessor
@@ -45,11 +47,16 @@ class KnowledgeGraphBuilder:
     5. 写入数据库
     """
     
-    def __init__(self):
-        """初始化知识图谱构建器"""
+    def __init__(self, progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None):
+        """初始化知识图谱构建器。
+
+        Args:
+            progress_callback: 外部进度回调，用于汇报细粒度构建状态。
+        """
         # 初始化终端界面
         self.console = Console()
         self.processed_documents = []
+        self.progress_callback = progress_callback
         
         # 添加计时器
         self.start_time = None
@@ -67,6 +74,18 @@ class KnowledgeGraphBuilder:
         # 初始化组件
         self._initialize_components()
 
+    def _emit_progress(self, message: str, progress: float, stage: str) -> None:
+        """发送结构化进度事件。"""
+        if not self.progress_callback:
+            return
+        self.progress_callback(
+            {
+                "stage": stage,
+                "message": message,
+                "progress": progress,
+            }
+        )
+
     def _create_progress(self):
         """创建进度显示器"""
         return Progress(
@@ -80,6 +99,7 @@ class KnowledgeGraphBuilder:
     def _initialize_components(self):
         """初始化所有必要的组件"""
         init_start = time.time()
+        self._emit_progress("初始化知识图谱构建组件", 0.14, "graph_init")
         
         with self._create_progress() as progress:
             task = progress.add_task("[cyan]初始化组件...", total=4)
@@ -106,16 +126,20 @@ class KnowledgeGraphBuilder:
                 entity_types,
                 relationship_types,
                 max_workers=MAX_WORKERS,
-                batch_size=5  # LLM批处理大小保持小一些以确保质量
+                batch_size=LLM_BATCH_SIZE,
+                batch_system_template=system_template_build_graph_batch,
+                batch_human_template=human_template_build_graph_batch,
             )
             
             # 输出使用的参数
             self.console.print(f"[blue]并行处理线程数: {MAX_WORKERS}[/blue]")
             self.console.print(f"[blue]数据库批处理大小: {BATCH_SIZE}[/blue]")
+            self.console.print(f"[blue]LLM批处理大小: {LLM_BATCH_SIZE}[/blue]")
             
             progress.advance(task)
         
         self.performance_stats["初始化"] = time.time() - init_start
+        self._emit_progress("基础构建组件初始化完成", 0.18, "graph_init")
 
     def _display_stage_header(self, title: str):
         """显示处理阶段的标题"""
@@ -150,6 +174,7 @@ class KnowledgeGraphBuilder:
         try:
             # 1. 处理文件（读取和分块）
             process_start = time.time()
+            self._emit_progress("开始处理文件与文本分块", 0.20, "document_processing")
             with self._create_progress() as progress:
                 task = progress.add_task("[cyan]处理文件...", total=1)
                 
@@ -176,6 +201,11 @@ class KnowledgeGraphBuilder:
                 self.console.print(table)
             
             self.performance_stats["文件处理"] = time.time() - process_start
+            self._emit_progress(
+                f"文件处理完成，共 {len(self.processed_documents)} 个文件",
+                0.28,
+                "document_processing",
+            )
             
             # 显示分块统计
             total_chunks = sum(doc.get("chunk_count", 0) for doc in self.processed_documents)
@@ -187,6 +217,7 @@ class KnowledgeGraphBuilder:
             
             # 3. 构建图结构
             struct_start = time.time()
+            self._emit_progress("开始构建图结构", 0.30, "graph_structure")
             with self._create_progress() as progress:
                 task = progress.add_task("[cyan]构建图结构...", total=3)
                 
@@ -225,15 +256,47 @@ class KnowledgeGraphBuilder:
                 progress.advance(task)
             
             self.performance_stats["图结构构建"] = time.time() - struct_start
+            self._emit_progress("图结构构建完成", 0.40, "graph_structure")
             
             # 4. 提取实体和关系
             extract_start = time.time()
+            self._emit_progress("开始提取实体和关系", 0.42, "entity_extraction")
             with self._create_progress() as progress:
                 total_chunks = sum(doc.get("chunk_count", 0) for doc in self.processed_documents)
                 task = progress.add_task("[cyan]提取实体和关系...", total=total_chunks)
+                processed_chunk_count = 0
+                last_reported_count = 0
+                report_step = max(1, total_chunks // 20) if total_chunks else 1
                 
-                def progress_callback(chunk_index):
+                def progress_callback(progress_event):
+                    nonlocal processed_chunk_count, last_reported_count
+                    if isinstance(progress_event, dict):
+                        event_type = progress_event.get("event")
+                        if event_type == "batch_started":
+                            batch_index = progress_event.get("batch_index", "-")
+                            batch_total = progress_event.get("batch_total", "-")
+                            chunk_end = progress_event.get("chunk_end", 0)
+                            self._emit_progress(
+                                f"提取实体和关系：开始批次 {batch_index}/{batch_total}，当前覆盖 {chunk_end}/{total_chunks}",
+                                0.42 + (0.18 * processed_chunk_count / max(total_chunks, 1)),
+                                "entity_extraction",
+                            )
+                        return
+
+                    processed_chunk_count += 1
                     progress.advance(task)
+                    # 仅在达到 5% 档位或完成时同步一次，避免后台状态文件被高频刷写。
+                    if (
+                        processed_chunk_count == total_chunks
+                        or processed_chunk_count - last_reported_count >= report_step
+                    ):
+                        extraction_progress = 0.42 + (0.18 * processed_chunk_count / max(total_chunks, 1))
+                        self._emit_progress(
+                            f"提取实体和关系：{processed_chunk_count}/{total_chunks}",
+                            extraction_progress,
+                            "entity_extraction",
+                        )
+                        last_reported_count = processed_chunk_count
                 
                 # 准备处理的数据格式
                 file_contents_format = []
@@ -277,6 +340,7 @@ class KnowledgeGraphBuilder:
                             self.console.print(f"[yellow]警告: 文件 {filename} 的实体抽取结果未找到[/yellow]")
             
             self.performance_stats["实体抽取"] = time.time() - extract_start
+            self._emit_progress("实体和关系提取完成", 0.60, "entity_extraction")
             
             # 输出缓存统计
             cache_hits = getattr(self.entity_extractor, 'cache_hits', 0)
@@ -288,6 +352,7 @@ class KnowledgeGraphBuilder:
             
             # 5. 写入数据库
             write_start = time.time()
+            self._emit_progress("开始写入图数据库", 0.61, "graph_write")
             with self._create_progress() as progress:
                 task = progress.add_task("[cyan]写入数据库...", total=1)
                 
@@ -327,6 +392,7 @@ class KnowledgeGraphBuilder:
                 progress.update(task, completed=1)
             
             self.performance_stats["写入数据库"] = time.time() - write_start
+            self._emit_progress("基础知识图谱已写入数据库", 0.70, "graph_write")
             
             self.console.print("[green]基础知识图谱构建完成[/green]")
             

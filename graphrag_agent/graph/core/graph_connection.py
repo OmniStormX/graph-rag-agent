@@ -19,9 +19,16 @@ class GraphConnectionManager:
     def __init__(self):
         """初始化连接管理器，只在第一次创建时执行"""
         if not getattr(self, "_initialized", False):
-            db_manager = get_db_manager()
-            self.graph = db_manager.graph
+            self._graph = None
             self._initialized = True
+
+    @property
+    def graph(self):
+        """按需获取图连接，避免模块导入阶段提前触发 Neo4j 连接。"""
+        if self._graph is None:
+            db_manager = get_db_manager()
+            self._graph = db_manager.graph
+        return self._graph
     
     def get_connection(self):
         """

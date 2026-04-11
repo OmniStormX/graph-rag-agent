@@ -3,7 +3,7 @@ from typing import Any, AsyncGenerator, Dict, List
 import json
 import re
 
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import END
@@ -18,6 +18,7 @@ from graphrag_agent.config.prompts import (
 )
 from graphrag_agent.config.settings import response_type
 from graphrag_agent.search.tool.global_search_tool import GlobalSearchTool
+from graphrag_agent.search.tool.fluid_property_tool import FluidPropertyTool
 from graphrag_agent.search.tool.local_search_tool import LocalSearchTool
 
 
@@ -28,6 +29,7 @@ class GraphAgent(BaseAgent):
         # 初始化本地和全局搜索工具。
         self.local_tool = LocalSearchTool()
         self.global_tool = GlobalSearchTool()
+        self.fluid_property_tool = FluidPropertyTool()
 
         # 设置缓存目录。
         self.cache_dir = "./cache/graph_agent"
@@ -40,6 +42,7 @@ class GraphAgent(BaseAgent):
         return [
             self.local_tool.get_tool(),
             self.global_tool.get_tool(),
+            self.fluid_property_tool.get_tool(),
         ]
 
     def _add_retrieval_edges(self, workflow):
@@ -81,6 +84,101 @@ class GraphAgent(BaseAgent):
             print(f"关键词提取失败: {e}")
 
         return {"low_level": [], "high_level": []}
+
+    def _resolve_fluid_request(self, query: str) -> Dict[str, Any] | None:
+        """识别典型物性计算问句，并解析为结构化请求。"""
+        if not isinstance(query, str) or not query.strip():
+            return None
+
+        # 复用工具内置的自然语言解析逻辑，确保路由条件与实际可执行条件一致。
+        try:
+            normalized = self.fluid_property_tool._normalize_request({"query": query})  # noqa: SLF001
+        except Exception:
+            return None
+
+        # 仅当能够解析出完整请求时才强制走工具，避免误路由普通知识问答。
+        if not normalized.get("fluid") or not normalized.get("inputs") or not normalized.get("outputs"):
+            return None
+        return normalized
+
+    @staticmethod
+    def _classify_state_pair(inputs: Dict[str, Any], metadata: Dict[str, Any] | None = None) -> str:
+        """根据两个已知状态量给出状态量组合类型说明。"""
+        keys = list(inputs.keys())
+        if len(keys) != 2:
+            return "两独立状态量组合"
+        if metadata and metadata.get("near_saturation") and set(keys) == {"T", "P"}:
+            return f"{keys[0]}-{keys[1]} 状态点接近饱和线"
+        return f"{keys[0]}-{keys[1]} 两独立状态量组合"
+
+    def _format_fluid_answer(
+        self,
+        query: str,
+        normalized: Dict[str, Any],
+        result: Dict[str, Any],
+    ) -> str:
+        """将物性工具结果格式化为用户可读回答。"""
+        if not result.get("success"):
+            error_message = result.get("error") or "未知错误"
+            return f"流体物性计算失败：{error_message}"
+
+        inputs = normalized.get("inputs", {})
+        outputs = result.get("results", {})
+        metadata = result.get("metadata", {}) or {}
+        state_pair = self._classify_state_pair(inputs, metadata)
+
+        lines = [
+            f"{normalized.get('fluid', '该工质')} 在给定状态下的计算结果如下：",
+        ]
+        if "T" in inputs:
+            lines.append(f"- 温度 T = {inputs['T']} K")
+        if "P" in inputs:
+            lines.append(f"- 压强 P = {inputs['P']} kPa")
+        if "H" in inputs:
+            lines.append(f"- 比焓 H = {inputs['H']} kJ/kg")
+        if "S" in inputs:
+            lines.append(f"- 比熵 S = {inputs['S']} kJ/(kg*K)")
+        if "D" in inputs:
+            lines.append(f"- 密度 D = {inputs['D']} kg/m^3")
+        if "Q" in inputs:
+            lines.append(f"- 干度 Q = {inputs['Q']}")
+
+        for key, value in outputs.items():
+            if key == "T":
+                lines.append(f"- 计算得到温度 T = {value:.6f} K")
+            elif key == "P":
+                lines.append(f"- 计算得到压强 P = {value:.6f} kPa")
+            elif key == "H":
+                lines.append(f"- 计算得到比焓 H = {value:.6f} kJ/kg")
+            elif key == "S":
+                lines.append(f"- 计算得到比熵 S = {value:.6f} kJ/(kg*K)")
+            elif key == "D":
+                lines.append(f"- 计算得到密度 D = {value:.6f} kg/m^3")
+            elif key == "Q":
+                if value is None:
+                    lines.append("- 当前状态位于单相区，干度 Q 无定义")
+                else:
+                    lines.append(f"- 计算得到干度 Q = {value:.6f}")
+
+        lines.append(f"这属于 {state_pair} 的物性计算。")
+        for note in metadata.get("notes", []):
+            lines.append(f"- 说明：{note}")
+        return "\n".join(lines)
+
+    def _try_direct_fluid_answer(self, query: str) -> str | None:
+        """对物性计算请求直接调用工具，绕开模型函数调用兼容问题。"""
+        normalized = self._resolve_fluid_request(query)
+        if normalized is None:
+            return None
+
+        result = self.fluid_property_tool.calculate(normalized)
+        answer = self._format_fluid_answer(query, normalized, result)
+        self._log_execution(
+            "direct_fluid_property_calc",
+            {"query": query, "normalized": normalized},
+            result,
+        )
+        return answer
 
     def _build_keyword_cache_params(
         self,
@@ -213,6 +311,34 @@ class GraphAgent(BaseAgent):
             response,
         )
         return {"messages": [AIMessage(content=response)]}
+
+    def _agent_node(self, state):
+        """Agent 节点逻辑。"""
+        return super()._agent_node(state)
+
+    def ask(self, query: str, thread_id: str = "default", recursion_limit=None):
+        """优先处理可直接执行的物性计算请求。"""
+        direct_answer = self._try_direct_fluid_answer(query.strip())
+        if direct_answer:
+            if len(direct_answer) > 10:
+                self.cache_manager.set(query.strip(), direct_answer, thread_id=thread_id)
+                self.global_cache_manager.set(query.strip(), direct_answer)
+            return direct_answer
+        return super().ask(query, thread_id=thread_id, recursion_limit=recursion_limit)
+
+    async def ask_stream(self, query: str, thread_id: str = "default", recursion_limit=None) -> AsyncGenerator[Any, None]:
+        """流式模式下优先处理可直接执行的物性计算请求。"""
+        safe_query = query.strip()
+        direct_answer = self._try_direct_fluid_answer(safe_query)
+        if direct_answer:
+            yield self._make_stage_event("fluid_property_calc", "正在进行流体物性计算", source="direct_tool")
+            yield direct_answer
+            if len(direct_answer) > 10:
+                self.cache_manager.set(safe_query, direct_answer, thread_id=thread_id)
+                self.global_cache_manager.set(safe_query, direct_answer)
+            return
+        async for chunk in super().ask_stream(query, thread_id=thread_id, recursion_limit=recursion_limit):
+            yield chunk
 
     def _reduce_node(self, state):
         """处理全局搜索的 reduce 节点逻辑。"""

@@ -2,8 +2,9 @@ NEO4J_SERVICE ?= neo4j
 NEO4J_USER ?= neo4j
 NEO4J_PASSWORD ?= 12345678
 FORCE ?= 0
+ADMIN_BACKEND_PORT ?= 8001
 
-.PHONY: clean-neo4j clean-cache reset-graph verify-neo4j rebuild-graph start-backend start-frontend
+.PHONY: clean-neo4j clean-cache reset-graph verify-neo4j rebuild-graph start-backend start-frontend start-admin-frontend start-admin-backend help-admin
 
 clean-cache:
 	@echo "清空本地缓存目录..."
@@ -40,8 +41,24 @@ rebuild-graph: clean-neo4j
 
 start-backend:
 	@echo "启动 FastAPI 后端..."
-	@cd server && PYTHONPATH=.. python -m uvicorn main:app --reload
+	@cd server && PYTHONPATH=.. python -m uvicorn main:app --reload --port 8000
 
 start-frontend:
 	@echo "启动 Streamlit 前端..."
 	@cd frontend && PYTHONPATH=.. streamlit run app.py --server.fileWatcherType none
+
+start-admin-backend:
+	@echo "启动 Admin FastAPI 后端，监听端口 $(ADMIN_BACKEND_PORT)..."
+	@cd server && PYTHONPATH=.. python -m uvicorn main:app --reload --port $(ADMIN_BACKEND_PORT)
+
+start-admin-frontend:
+	@echo "启动 Admin Streamlit 前端..."
+	@cd frontend && ADMIN_FRONTEND_API_URL=http://127.0.0.1:$(ADMIN_BACKEND_PORT) PYTHONPATH=.. streamlit run admin_app.py --server.fileWatcherType none
+
+help-admin:
+	@echo "后台管理系统启动说明："
+	@echo "1. 确保 .env 中 GRAPH_ADMIN_ENABLED=true"
+	@echo "2. 确保 PostgreSQL 已启动且 GRAPH_ADMIN_METADATA_DSN 可用"
+	@echo "3. 启动后端: make start-admin-backend"
+	@echo "4. 启动前端: make start-admin-frontend"
+	@echo "5. 当前默认后台端口: $(ADMIN_BACKEND_PORT)"

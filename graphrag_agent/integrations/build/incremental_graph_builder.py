@@ -1,5 +1,5 @@
 import time
-from typing import Dict, List, Any
+from typing import Callable, Dict, List, Any, Optional
 from pathlib import Path
 import os
 import tempfile
@@ -9,9 +9,15 @@ from rich.console import Console
 from rich.table import Table
 
 from graphrag_agent.models.get_models import get_llm_model
-from graphrag_agent.config.prompts import system_template_build_graph, human_template_build_graph
+from graphrag_agent.config.prompts.graph_prompts import (
+    system_template_build_graph,
+    human_template_build_graph,
+    system_template_build_graph_batch,
+    human_template_build_graph_batch,
+)
 from graphrag_agent.config.settings import (
     entity_types, relationship_types, CHUNK_SIZE, OVERLAP, MAX_WORKERS, BATCH_SIZE,
+    LLM_BATCH_SIZE,
     FILE_REGISTRY_PATH
 )
 from graphrag_agent.pipelines.ingestion.document_processor import DocumentProcessor
@@ -19,6 +25,7 @@ from graphrag_agent.graph import EntityRelationExtractor, GraphWriter, GraphStru
 from graphrag_agent.config.neo4jdb import get_db_manager
 from graphrag_agent.integrations.build.incremental.file_change_manager import FileChangeManager
 from graphrag_agent.graph.indexing.embedding_manager import EmbeddingManager
+from graphrag_agent.integrations.build.build_chunk_index import ChunkIndexBuilder
 
 class IncrementalGraphUpdater:
     """
@@ -31,19 +38,26 @@ class IncrementalGraphUpdater:
     4. 保护现有图谱的完整性
     """
     
-    def __init__(self, files_dir: str, registry_path: str = None):
+    def __init__(
+        self,
+        files_dir: str,
+        registry_path: str = None,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ):
         """
         初始化增量图谱更新器
 
         Args:
             files_dir: 文件目录
             registry_path: 文件注册表路径，默认使用配置中的路径
+            progress_callback: 外部进度回调，用于同步后台任务状态
         """
         if registry_path is None:
             registry_path = str(FILE_REGISTRY_PATH)
 
         self.console = Console()
         self.graph = get_db_manager().graph
+        self.progress_callback = progress_callback
         
         # 初始化文件变更管理器
         self.file_manager = FileChangeManager(files_dir, registry_path)
@@ -70,7 +84,10 @@ class IncrementalGraphUpdater:
             human_template_build_graph,
             entity_types,
             relationship_types,
-            max_workers=MAX_WORKERS
+            max_workers=MAX_WORKERS,
+            batch_size=LLM_BATCH_SIZE,
+            batch_system_template=system_template_build_graph_batch,
+            batch_human_template=human_template_build_graph_batch,
         )
         
         # 初始化图写入器
@@ -87,6 +104,18 @@ class IncrementalGraphUpdater:
             "entities_updated": 0,
             "chunks_updated": 0
         }
+
+    def _emit_progress(self, message: str, progress: float, stage: str) -> None:
+        """发送结构化进度事件。"""
+        if not self.progress_callback:
+            return
+        self.progress_callback(
+            {
+                "stage": stage,
+                "message": message,
+                "progress": progress,
+            }
+        )
     
     def detect_changes(self) -> Dict[str, List[str]]:
         """
@@ -96,6 +125,91 @@ class IncrementalGraphUpdater:
             Dict: 文件变更信息
         """
         return self.file_manager.detect_changes()
+
+    def _normalize_file_paths(self, file_paths: List[str]) -> List[str]:
+        """将输入文件路径统一规范为可访问的绝对路径列表。"""
+        normalized_paths: List[str] = []
+        for file_path in file_paths:
+            candidate = str(file_path).strip()
+            if not candidate:
+                continue
+
+            candidate_path = Path(candidate)
+            if candidate_path.exists():
+                normalized_paths.append(str(candidate_path))
+                continue
+
+            joined_path = Path(self.files_dir) / candidate
+            if joined_path.exists():
+                normalized_paths.append(str(joined_path))
+                continue
+
+            # 保留原始值用于后续日志输出，便于定位缺失文件。
+            normalized_paths.append(candidate)
+        return normalized_paths
+
+    def process_updated_files(self, updated_files: List[str]) -> Dict[str, Any]:
+        """对已修改文件执行“删除旧图数据后重建”的增量更新。"""
+        normalized_files = self._normalize_file_paths(updated_files)
+        if not normalized_files:
+            return {"files_processed": 0, "entities_extracted": 0, "relations_created": 0}
+
+        deleted_count = self.process_deleted_files(normalized_files)
+        self.console.print(f"[blue]已清理修改文件对应旧数据，共删除 {deleted_count} 个节点[/blue]")
+        self._emit_progress(
+            f"已清理修改文件旧图数据，共 {len(normalized_files)} 个文件",
+            0.30,
+            "incremental_modified_cleanup",
+        )
+
+        rebuild_results = self.process_new_files(normalized_files)
+        return rebuild_results
+
+    def rebuild_indexes_and_communities(self) -> None:
+        """重建实体索引、社区检测与社区摘要。
+
+        说明：
+            增量构建更新了实体和关系后，社区结构与社区摘要也需要同步刷新，
+            否则前端“全局社区图谱”会继续读取旧的 `__Community__` 节点结果。
+        """
+        self.console.print("[bold cyan]重建实体索引与社区...[/bold cyan]")
+        self._emit_progress("开始重建实体索引与社区", 0.86, "incremental_rebuild_community")
+
+        # 清理旧社区节点与关系，避免增量结果和旧社区结构混合。
+        self.graph.query(
+            """
+            MATCH (e:`__Entity__`)-[r:IN_COMMUNITY]->(:`__Community__`)
+            DELETE r
+            """
+        )
+        self.graph.query(
+            """
+            MATCH (c:`__Community__`)
+            DETACH DELETE c
+            """
+        )
+        self.graph.query(
+            """
+            MATCH (e:`__Entity__`)
+            REMOVE e.communities, e.communityIds
+            """
+        )
+
+        from graphrag_agent.integrations.build.build_index_and_community import (
+            IndexCommunityBuilder,
+        )
+
+        builder = IndexCommunityBuilder(progress_callback=self.progress_callback)
+        builder.process()
+        self._emit_progress("实体索引与社区重建完成", 0.96, "incremental_rebuild_community")
+
+    def rebuild_chunk_index(self) -> None:
+        """重建 Chunk 向量索引，补齐与全量构建一致的最后一步。"""
+        self.console.print("[bold cyan]重建文本块索引...[/bold cyan]")
+        self._emit_progress("开始重建文本块索引", 0.97, "incremental_rebuild_chunk_index")
+        chunk_index_builder = ChunkIndexBuilder()
+        chunk_index_builder.process()
+        self._emit_progress("文本块索引重建完成", 0.99, "incremental_rebuild_chunk_index")
     
     def process_new_files(self, added_files: List[str]) -> Dict[str, Any]:
         """
@@ -107,7 +221,8 @@ class IncrementalGraphUpdater:
         Returns:
             Dict: 处理结果统计
         """
-        if not added_files:
+        normalized_files = self._normalize_file_paths(added_files)
+        if not normalized_files:
             return {"files_processed": 0, "entities_extracted": 0, "relations_created": 0}
         
         results = {
@@ -116,10 +231,15 @@ class IncrementalGraphUpdater:
             "relations_created": 0
         }
         
-        self.console.print(f"[bold cyan]正在处理 {len(added_files)} 个新文件...[/bold cyan]")
+        self.console.print(f"[bold cyan]正在处理 {len(normalized_files)} 个新文件...[/bold cyan]")
+        self._emit_progress(
+            f"正在处理新增文件，共 {len(normalized_files)} 个",
+            0.24,
+            "incremental_new_files",
+        )
         
         # 打印文件路径以便调试
-        for file_path in added_files:
+        for file_path in normalized_files:
             self.console.print(f"[blue]处理文件路径: {file_path}[/blue]")
             if not os.path.exists(file_path):
                 self.console.print(f"[red]警告: 文件不存在: {file_path}[/red]")
@@ -130,7 +250,7 @@ class IncrementalGraphUpdater:
             try:
                 # 复制文件到临时目录
                 copy_success = False
-                for file_path in added_files:
+                for file_path in normalized_files:
                     try:
                         if os.path.exists(file_path):
                             file_name = os.path.basename(file_path)
@@ -219,21 +339,53 @@ class IncrementalGraphUpdater:
                         self.console.print(f"[blue]总计 {total_chunks} 个文本块需要处理[/blue]")
                         
                         processed_chunk_count = 0
-                        def progress_callback(i):
+                        report_step = max(1, total_chunks // 20) if total_chunks else 1
+                        def progress_callback(progress_event):
                             nonlocal processed_chunk_count
+                            if isinstance(progress_event, dict):
+                                event_type = progress_event.get("event")
+                                if event_type == "batch_started":
+                                    batch_index = progress_event.get("batch_index", "-")
+                                    batch_total = progress_event.get("batch_total", "-")
+                                    chunk_end = progress_event.get("chunk_end", 0)
+                                    self._emit_progress(
+                                        f"提取实体和关系：开始批次 {batch_index}/{batch_total}，当前覆盖 {chunk_end}/{total_chunks}",
+                                        0.34 + (0.34 * processed_chunk_count / max(total_chunks, 1)),
+                                        "incremental_entity_extraction",
+                                    )
+                                return
+
                             processed_chunk_count += 1
                             if processed_chunk_count % 5 == 0 or processed_chunk_count == total_chunks:
                                 self.console.print(f"[blue]已处理 {processed_chunk_count}/{total_chunks} 个文本块[/blue]")
+                            if (
+                                processed_chunk_count == total_chunks
+                                or processed_chunk_count % report_step == 0
+                            ):
+                                current_progress = 0.34 + (0.34 * processed_chunk_count / max(total_chunks, 1))
+                                self._emit_progress(
+                                    f"提取实体和关系：{processed_chunk_count}/{total_chunks}",
+                                    current_progress,
+                                    "incremental_entity_extraction",
+                                )
                         
                         # 确保禁用缓存以处理新文件
                         original_cache_setting = getattr(self.entity_extractor, 'enable_cache', True)
                         self.entity_extractor.enable_cache = False
                         
                         try:
-                            processed_contents = self.entity_extractor.process_chunks(
-                                file_contents_format, 
-                                progress_callback=progress_callback
-                            )
+                            # 与全量构建保持一致：大批量场景优先使用批量提示词协议，
+                            # 避免增量构建与全量构建在抽取格式和 token 消耗上出现分叉。
+                            if total_chunks > 100:
+                                processed_contents = self.entity_extractor.process_chunks_batch(
+                                    file_contents_format,
+                                    progress_callback=progress_callback,
+                                )
+                            else:
+                                processed_contents = self.entity_extractor.process_chunks(
+                                    file_contents_format,
+                                    progress_callback=progress_callback,
+                                )
                             
                             # 恢复缓存设置
                             self.entity_extractor.enable_cache = original_cache_setting
@@ -285,8 +437,14 @@ class IncrementalGraphUpdater:
                                 # 9. 写入图数据库
                                 if graph_writer_data:
                                     self.console.print(f"[cyan]开始写入 {len(graph_writer_data)} 个文件的图数据...[/cyan]")
+                                    self._emit_progress(
+                                        f"写入新增文件图数据，共 {len(graph_writer_data)} 个文件",
+                                        0.72,
+                                        "incremental_graph_write",
+                                    )
                                     self.graph_writer.process_and_write_graph_documents(graph_writer_data)
                                     self.console.print(f"[green]图数据写入完成[/green]")
+                                    self._emit_progress("新增文件图数据写入完成", 0.78, "incremental_graph_write")
                                 else:
                                     self.console.print("[yellow]没有有效的图数据需要写入[/yellow]")
                             else:
@@ -307,6 +465,11 @@ class IncrementalGraphUpdater:
                 self.console.print(f"[red]{traceback.format_exc()}[/red]")
         
         self.console.print(f"[green]已完成处理 {results['files_processed']} 个新文件[/green]")
+        self._emit_progress(
+            f"新增文件处理完成，成功处理 {results['files_processed']} 个文件",
+            0.80,
+            "incremental_new_files",
+        )
         if results["entities_extracted"] > 0 or results["relations_created"] > 0:
             self.console.print(f"[green]抽取了 {results['entities_extracted']} 个实体和 {results['relations_created']} 个关系[/green]")
         
@@ -896,6 +1059,7 @@ class IncrementalGraphUpdater:
         try:
             # 1. 检测文件变更
             self.console.print("[bold cyan]检测文件变更...[/bold cyan]")
+            self._emit_progress("检测文件变更", 0.08, "incremental_detect_changes")
             changes = self.detect_changes()
             
             # 分别处理新增、修改和删除的文件
@@ -903,40 +1067,76 @@ class IncrementalGraphUpdater:
             modified_files = changes.get("modified", [])
             deleted_files = changes.get("deleted", [])
             
-            changed_files = modified_files  # 只有修改的文件需要更新embedding
+            changed_files = modified_files  # 修改文件既要重建图谱，也要刷新 embedding
             self.stats["files_processed"] = len(added_files) + len(modified_files) + len(deleted_files)
             
             if not added_files and not changed_files and not deleted_files:
                 self.console.print("[yellow]未检测到文件变更[/yellow]")
+                self._emit_progress("未检测到文件变更", 1.0, "completed")
                 return self.stats
             
             # 2. 处理已删除的文件
             if deleted_files:
                 self.console.print("[bold cyan]处理已删除的文件...[/bold cyan]")
+                self._emit_progress(
+                    f"处理已删除文件，共 {len(deleted_files)} 个",
+                    0.16,
+                    "incremental_deleted_files",
+                )
                 self.process_deleted_files(deleted_files)
             
             # 3. 处理新文件 - 执行完整的处理流程
             if added_files:
                 self.console.print("[bold cyan]处理新增文件...[/bold cyan]")
+                self._emit_progress(
+                    f"处理新增文件，共 {len(added_files)} 个",
+                    0.22,
+                    "incremental_added_files",
+                )
                 new_file_results = self.process_new_files(added_files)
                 # 更新统计信息
                 self.stats["entities_integrated"] += new_file_results.get("entities_extracted", 0)
                 self.stats["relations_integrated"] += new_file_results.get("relations_created", 0)
+
+            # 4. 处理已修改的文件：先清旧数据，再执行完整重建。
+            if modified_files:
+                self.console.print("[bold cyan]处理已修改文件...[/bold cyan]")
+                self._emit_progress(
+                    f"处理已修改文件，共 {len(modified_files)} 个",
+                    0.28,
+                    "incremental_modified_files",
+                )
+                updated_file_results = self.process_updated_files(modified_files)
+                self.stats["entities_integrated"] += updated_file_results.get("entities_extracted", 0)
+                self.stats["relations_integrated"] += updated_file_results.get("relations_created", 0)
             
-            # 4. 更新变更文件的Embedding
+            # 5. 更新变更文件的Embedding
             if changed_files:
                 self.console.print("[bold cyan]更新变更文件的Embedding...[/bold cyan]")
+                self._emit_progress(
+                    f"更新变更文件 Embedding，共 {len(changed_files)} 个",
+                    0.82,
+                    "incremental_embeddings",
+                )
                 embedding_stats = self.update_changed_file_embeddings(changed_files)
                 
                 # 显示Embedding更新结果
                 self.console.print(f"[green]更新的实体Embedding: {embedding_stats['entities']}[/green]")
                 self.console.print(f"[green]更新的Chunk Embedding: {embedding_stats['chunks']}[/green]")
             
-            # 5. 更新文件注册表
+            # 6. 重建实体索引和社区，确保全局社区图谱与最新图结构一致。
+            self.rebuild_indexes_and_communities()
+
+            # 7. 重建 Chunk 索引，补齐与全量构建相同的后处理流程。
+            self.rebuild_chunk_index()
+
+            # 8. 更新文件注册表
             self.file_manager.update_registry()
+            self._emit_progress("文件注册表已更新", 0.97, "incremental_registry")
             
-            # 6. 显示图谱统计信息
+            # 9. 显示图谱统计信息
             self.console.print("[bold cyan]图谱统计信息[/bold cyan]")
+            self._emit_progress("刷新图谱统计信息", 0.98, "incremental_statistics")
             self.display_graph_statistics()
             
             # 计算结束时间和总时间
@@ -946,6 +1146,7 @@ class IncrementalGraphUpdater:
             
             # 显示处理结果
             self.console.print("\n[bold green]增量更新完成![/bold green]")
+            self._emit_progress("增量更新完成", 1.0, "completed")
             self.console.print(f"[green]总耗时: {self.stats['total_time']:.2f}秒[/green]")
             self.console.print(f"[green]处理的文件数: {self.stats['files_processed']}[/green]")
             if added_files:
@@ -956,10 +1157,79 @@ class IncrementalGraphUpdater:
             
         except Exception as e:
             self.console.print(f"[red]增量更新过程中出现错误: {e}[/red]")
+            self._emit_progress(f"增量更新过程中出现错误: {e}", 1.0, "failed")
             
             # 记录结束时间和总时间
             end_time = time.time()
             self.stats["end_time"] = end_time
             self.stats["total_time"] = end_time - start_time
             
+            raise
+
+    def process_selected_files(self, selected_files: List[str]) -> Dict[str, Any]:
+        """仅对指定文件执行补充构建。
+
+        Args:
+            selected_files: 需要补建的文件路径列表，支持绝对路径或相对 ``files_dir`` 的路径。
+
+        Returns:
+            Dict: 本次补建的统计结果。
+        """
+        start_time = time.time()
+        self.stats["start_time"] = start_time
+
+        normalized_files = self._normalize_file_paths(selected_files)
+        if not normalized_files:
+            self.console.print("[yellow]未提供需要补建的文件[/yellow]")
+            self._emit_progress("未提供需要补建的文件", 1.0, "completed")
+            return self.stats
+
+        try:
+            self.console.print("[bold cyan]处理指定文件补建...[/bold cyan]")
+            self._emit_progress(
+                f"处理指定文件补建，共 {len(normalized_files)} 个",
+                0.16,
+                "incremental_selected_files",
+            )
+
+            # 指定文件补建默认视为“以最新内容重建这些文件”，
+            # 这样同一文件重复上传后不会残留旧 chunk 或旧关系。
+            build_results = self.process_updated_files(normalized_files)
+            self.stats["files_processed"] = build_results.get("files_processed", 0)
+            self.stats["entities_integrated"] += build_results.get("entities_extracted", 0)
+            self.stats["relations_integrated"] += build_results.get("relations_created", 0)
+
+            self.update_changed_file_embeddings(normalized_files)
+
+            # 指定文件补建完成后同步重建社区，避免全局社区图谱继续读取旧结果。
+            self.rebuild_indexes_and_communities()
+
+            # 与全量构建保持一致，补建后同步刷新 Chunk 向量索引。
+            self.rebuild_chunk_index()
+
+            # 指定文件补建完成后刷新注册表，避免后续目录监听重复识别。
+            self.file_manager.update_registry()
+            self._emit_progress("文件注册表已更新", 0.97, "incremental_registry")
+
+            self.console.print("[bold cyan]图谱统计信息[/bold cyan]")
+            self._emit_progress("刷新图谱统计信息", 0.98, "incremental_statistics")
+            self.display_graph_statistics()
+
+            end_time = time.time()
+            self.stats["end_time"] = end_time
+            self.stats["total_time"] = end_time - start_time
+
+            self.console.print("\n[bold green]指定文件补建完成![/bold green]")
+            self._emit_progress("指定文件补建完成", 1.0, "completed")
+            self.console.print(f"[green]总耗时: {self.stats['total_time']:.2f}秒[/green]")
+            self.console.print(f"[green]处理的文件数: {self.stats['files_processed']}[/green]")
+            self.console.print(f"[green]新增实体数: {self.stats['entities_integrated']}[/green]")
+            self.console.print(f"[green]新增关系数: {self.stats['relations_integrated']}[/green]")
+            return self.stats
+        except Exception as e:
+            self.console.print(f"[red]指定文件补建过程中出现错误: {e}[/red]")
+            self._emit_progress(f"指定文件补建过程中出现错误: {e}", 1.0, "failed")
+            end_time = time.time()
+            self.stats["end_time"] = end_time
+            self.stats["total_time"] = end_time - start_time
             raise

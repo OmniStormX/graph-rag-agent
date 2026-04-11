@@ -1,0 +1,7 @@
+[server]
+# 关闭源码文件监听，避免 Streamlit 在扫描 torch / HanLP 依赖时触发
+# `torch.classes` 相关异常与大量无关告警。
+fileWatcherType = "none"
+
+[logger]
+level = "warning"

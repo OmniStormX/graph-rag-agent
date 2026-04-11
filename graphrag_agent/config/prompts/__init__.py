@@ -7,6 +7,8 @@
 from graphrag_agent.config.prompts.graph_prompts import (
     system_template_build_graph,
     human_template_build_graph,
+    system_template_build_graph_batch,
+    human_template_build_graph_batch,
     system_template_build_index,
     user_template_build_index,
     community_template,
@@ -89,6 +91,8 @@ __all__ = [
     # 图谱构建相关模板
     "system_template_build_graph",
     "human_template_build_graph",
+    "system_template_build_graph_batch",
+    "human_template_build_graph_batch",
     "system_template_build_index",
     "user_template_build_index",
     "community_template",

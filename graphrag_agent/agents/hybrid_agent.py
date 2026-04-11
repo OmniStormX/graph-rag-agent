@@ -7,6 +7,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from graphrag_agent.agents.base import BaseAgent
 from graphrag_agent.config.prompts import HYBRID_AGENT_GENERATE_PROMPT, LC_SYSTEM_PROMPT
 from graphrag_agent.config.settings import response_type
+from graphrag_agent.search.tool.fluid_property_tool import FluidPropertyTool
 from graphrag_agent.search.tool.hybrid_tool import HybridSearchTool
 
 
@@ -15,6 +16,7 @@ class HybridAgent(BaseAgent):
 
     def __init__(self):
         self.search_tool = HybridSearchTool()
+        self.fluid_property_tool = FluidPropertyTool()
         self.cache_dir = "./cache/hybrid_agent"
         super().__init__(cache_dir=self.cache_dir)
 
@@ -23,6 +25,7 @@ class HybridAgent(BaseAgent):
         return [
             self.search_tool.get_tool(),
             self.search_tool.get_global_tool(),
+            self.fluid_property_tool.get_tool(),
         ]
 
     def _add_retrieval_edges(self, workflow):

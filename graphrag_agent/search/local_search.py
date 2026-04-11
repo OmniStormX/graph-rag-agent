@@ -7,6 +7,10 @@ from langchain_core.output_parsers import StrOutputParser
 from graphrag_agent.config.prompts import LC_SYSTEM_PROMPT, LOCAL_SEARCH_CONTEXT_PROMPT
 from graphrag_agent.config.neo4jdb import get_db_manager
 from graphrag_agent.config.settings import LOCAL_SEARCH_SETTINGS
+from graphrag_agent.search.vector_index_utils import (
+    build_missing_vector_index_message,
+    resolve_vector_index_name,
+)
 
 class LocalSearch:
     """
@@ -56,6 +60,7 @@ class LocalSearch:
         self.neo4j_uri = db_manager.neo4j_uri
         self.neo4j_username = db_manager.neo4j_username
         self.neo4j_password = db_manager.neo4j_password
+        self.index_name = self._resolve_index_name()
         
     def _init_community_weights(self):
         """初始化Neo4j中社区节点的权重"""
@@ -81,6 +86,93 @@ class LocalSearch:
             parameters_=params,
             result_transformer_=Result.to_df
         )
+
+    def _list_vector_indexes(self) -> list[dict]:
+        """查询当前 Neo4j 中可见的向量索引。"""
+        query = """
+        SHOW INDEXES
+        YIELD name, type, state, entityType, labelsOrTypes, properties
+        RETURN name, type, state, entityType, labelsOrTypes, properties
+        """
+        try:
+            result = self.driver.execute_query(
+                query,
+                result_transformer_=Result.to_df,
+            )
+            return result.to_dict("records") if hasattr(result, "to_dict") else []
+        except Exception:
+            return []
+
+    def _ensure_entity_vector_index(self) -> None:
+        """在索引缺失时尝试基于现有实体 embedding 恢复向量索引。"""
+        Neo4jVector.from_existing_graph(
+            self.embeddings,
+            url=self.neo4j_uri,
+            username=self.neo4j_username,
+            password=self.neo4j_password,
+            node_label="__Entity__",
+            text_node_properties=["id", "description"],
+            embedding_node_property="embedding",
+        )
+
+    def _resolve_index_name(self) -> str:
+        """解析可用于本地检索的向量索引名。"""
+        rows = self._list_vector_indexes()
+        resolved_name = resolve_vector_index_name(
+            rows,
+            preferred_name=self.index_name,
+            preferred_label="__Entity__",
+            preferred_property="embedding",
+        )
+        if resolved_name:
+            return resolved_name
+
+        # 若当前没有可用向量索引，尝试基于现有实体 embedding 自恢复一次。
+        try:
+            self._ensure_entity_vector_index()
+        except Exception:
+            pass
+
+        rows = self._list_vector_indexes()
+        resolved_name = resolve_vector_index_name(
+            rows,
+            preferred_name=self.index_name,
+            preferred_label="__Entity__",
+            preferred_property="embedding",
+        )
+        if resolved_name:
+            return resolved_name
+
+        raise RuntimeError(
+            build_missing_vector_index_message(
+                preferred_name=self.index_name,
+                rows=rows,
+            )
+        )
+
+    def _create_vector_store(self, retrieval_query: str):
+        """创建向量检索存储，并在索引失效时给出更清晰的错误。"""
+        self.index_name = self._resolve_index_name()
+        try:
+            return Neo4jVector.from_existing_index(
+                self.embeddings,
+                url=self.neo4j_uri,
+                username=self.neo4j_username,
+                password=self.neo4j_password,
+                index_name=self.index_name,
+                retrieval_query=retrieval_query,
+            )
+        except Exception as exc:
+            error_message = str(exc)
+            if "vector index name does not exist" in error_message.lower():
+                rows = self._list_vector_indexes()
+                raise RuntimeError(
+                    build_missing_vector_index_message(
+                        preferred_name=self.index_name,
+                        rows=rows,
+                    )
+                ) from exc
+            raise
         
     @property
     def retrieval_query(self) -> str:
@@ -153,14 +245,7 @@ class LocalSearch:
         db_manager = get_db_manager()
         
         # 初始化向量存储
-        vector_store = Neo4jVector.from_existing_index(
-            self.embeddings,
-            url=db_manager.neo4j_uri,
-            username=db_manager.neo4j_username,
-            password=db_manager.neo4j_password,
-            index_name=self.index_name,
-            retrieval_query=final_query
-        )
+        vector_store = self._create_vector_store(final_query)
         
         # 返回检索器
         return vector_store.as_retriever(
@@ -187,14 +272,7 @@ class LocalSearch:
         chain = prompt | self.llm | StrOutputParser()
         
         # 初始化向量存储
-        vector_store = Neo4jVector.from_existing_index(
-            self.embeddings,
-            url=self.neo4j_uri,
-            username=self.neo4j_username,
-            password=self.neo4j_password,
-            index_name=self.index_name,
-            retrieval_query=self.retrieval_query
-        )
+        vector_store = self._create_vector_store(self.retrieval_query)
         
         # 执行相似度搜索
         docs = vector_store.similarity_search(

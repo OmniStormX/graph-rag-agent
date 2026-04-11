@@ -94,10 +94,10 @@ KG_INTERACTION_SCRIPT = """
             
             // 添加控制面板标题
             var panelTitle = document.createElement('div');
-            panelTitle.style.fontWeight = 'bold';
-            panelTitle.style.marginBottom = '8px';
-            panelTitle.style.borderBottom = '1px solid #eee';
-            panelTitle.style.paddingBottom = '5px';
+            panelTitle.style.fontWeight = '600';
+            panelTitle.style.marginBottom = '10px';
+            panelTitle.style.borderBottom = '1px solid rgba(29,29,31,0.06)';
+            panelTitle.style.paddingBottom = '8px';
             panelTitle.textContent = '图谱控制';
             controlPanel.appendChild(panelTitle);
             
@@ -168,15 +168,15 @@ KG_INTERACTION_SCRIPT = """
                     ${label}
                 </div>
                 <div class="node-context-menu-item" id="focus-node">
-                    🔍 聚焦此节点
+                    聚焦此节点
                 </div>
                 <div class="node-context-menu-item" id="hide-node">
-                    🚫 隐藏此节点
+                    隐藏此节点
                 </div>
                 <div class="node-context-menu-item" id="show-info">
-                    ℹ️ 查看详细信息
+                    查看详细信息
                 </div>
-                <div class="node-context-menu-header" style="margin-top:5px;font-size:11px;color:#666;border-bottom:none;">
+                <div class="node-context-menu-header" style="margin-top:6px;font-size:11px;color:rgba(29,29,31,0.56);border-bottom:none;">
                     类型: ${group}
                 </div>
             `;

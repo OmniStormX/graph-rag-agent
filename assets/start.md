@@ -39,12 +39,49 @@ cd graph-rag-agent/
 docker compose up -d
 ```
 
-默认账号密码：
+默认会同时启动：
+
+- Neo4j 图数据库
+- PostgreSQL 图谱后台元数据库
+- Langfuse 可观测性服务
+- Langfuse Worker / ClickHouse / Redis / MinIO 依赖栈
+
+Neo4j 默认账号密码：
 
 ```
 用户名：neo4j
 密码：12345678
 ```
+
+PostgreSQL 默认连接信息：
+
+```
+数据库：graphrag_admin
+用户名：postgres
+密码：postgres
+地址：localhost:5432
+```
+
+Langfuse 默认访问地址：
+
+```
+Web UI：http://localhost:3000
+MinIO API：http://localhost:9090
+MinIO Console：http://localhost:9091
+```
+
+Langfuse 本地默认初始化账号：
+
+```
+邮箱：admin@example.com
+密码：admin123456
+项目：graph-rag
+```
+
+说明：
+
+- 这些默认值仅适合本地开发，生产环境务必改掉 `.env` 中的 Langfuse 密钥与口令
+- 若你只想启动图谱服务、不想启动 Langfuse，可使用 `docker compose up -d postgres neo4j`
 
 ## 环境搭建
 
@@ -146,6 +183,15 @@ GDS_MEMORY_LIMIT = 6
 # 根据文档特性调整分块大小
 CHUNK_SIZE = 500
 CHUNK_OVERLAP = 100
+
+# ===== 图谱后台管理系统 =====
+GRAPH_ADMIN_ENABLED = true
+GRAPH_ADMIN_METADATA_DSN = 'postgresql://postgres:postgres@localhost:5432/graphrag_admin'
+GRAPH_ADMIN_RUNTIME_DIR = './runtime/admin'
+GRAPH_ADMIN_BUILD_LOG_DIR = './runtime/admin/build_logs'
+GRAPH_ADMIN_SNAPSHOT_DIR = './runtime/admin/snapshots'
+GRAPH_ADMIN_UPLOAD_DIR = './runtime/admin/uploads'
+ADMIN_FRONTEND_API_URL = 'http://localhost:8001'
 ```
 
 ### 默认即可配置项
@@ -265,12 +311,35 @@ FUSION_AGENT_STREAM_FLUSH_THRESHOLD = 60
 以下配置为可选功能，不需要可以不配置或注释掉：
 
 ```env
-# ===== LangSmith 监控（可选）=====
+# ===== Langfuse 监控（可选，本地部署友好）=====
 # 不需要可以完全注释掉此部分
-LANGSMITH_TRACING = true
-LANGSMITH_ENDPOINT = "https://api.smith.langchain.com"
-LANGSMITH_API_KEY = "xxx"
-LANGSMITH_PROJECT = "xxx"
+LANGFUSE_ENABLED = false
+LANGFUSE_BASE_URL = "http://localhost:3000"
+LANGFUSE_HOST = "http://localhost:3000"
+LANGFUSE_PUBLIC_KEY = "pk-lf-xxx"
+LANGFUSE_SECRET_KEY = "sk-lf-xxx"
+
+# ===== Langfuse Docker 本地部署（可选）=====
+LANGFUSE_PUBLIC_URL = "http://localhost:3000"
+LANGFUSE_NEXTAUTH_SECRET = "change-this-nextauth-secret"
+LANGFUSE_SALT = "change-this-salt"
+LANGFUSE_ENCRYPTION_KEY = "0000000000000000000000000000000000000000000000000000000000000000"
+LANGFUSE_POSTGRES_PASSWORD = "langfuse"
+LANGFUSE_CLICKHOUSE_PASSWORD = "clickhouse"
+LANGFUSE_REDIS_PASSWORD = "langfuse-redis"
+LANGFUSE_MINIO_ROOT_USER = "minio"
+LANGFUSE_MINIO_ROOT_PASSWORD = "minio123456"
+LANGFUSE_S3_BUCKET = "langfuse"
+LANGFUSE_S3_REGION = "auto"
+LANGFUSE_INIT_ORG_ID = "graph-rag"
+LANGFUSE_INIT_ORG_NAME = "GraphRAG Local"
+LANGFUSE_INIT_PROJECT_ID = "graph-rag"
+LANGFUSE_INIT_PROJECT_NAME = "graph-rag"
+LANGFUSE_INIT_PROJECT_PUBLIC_KEY = "pk-lf-graph-rag-local"
+LANGFUSE_INIT_PROJECT_SECRET_KEY = "sk-lf-graph-rag-local"
+LANGFUSE_INIT_USER_EMAIL = "admin@example.com"
+LANGFUSE_INIT_USER_NAME = "GraphRAG Admin"
+LANGFUSE_INIT_USER_PASSWORD = "admin123456"
 ```
 
 ### 配置模板获取
@@ -459,9 +528,16 @@ response = requests.post(
 cd graph-rag-agent/
 python server/main.py
 
-# 启动前端
+# 启动问答前端
 cd graph-rag-agent/
 streamlit run frontend/app.py
+
+# 启动后台管理前端
+cd graph-rag-agent/
+streamlit run frontend/admin_app.py
 ```
 
 **注意**：由于langchain版本问题，目前的流式是伪流式实现，即先完整生成答案，再分段返回。
+
+如果启用了后台管理系统，请确认 `.env` 中的 `GRAPH_ADMIN_METADATA_DSN` 已正确指向 PostgreSQL，否则后台相关接口不会落库。
+如果后台通过 `make start-admin-backend` 启动，则默认监听 `8001` 端口，`ADMIN_FRONTEND_API_URL` 也应指向同一地址。

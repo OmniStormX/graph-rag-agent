@@ -55,7 +55,12 @@ class DocumentProcessor:
                 "extension": file_ext,
                 "content": content,
                 "content_length": len(content),
-                "chunks": None
+                "chunks": None,
+                "chunk_strategy": (
+                    "english_sentence_chunking"
+                    if self.chunker._is_english_dominant(content)
+                    else "hanlp_mixed_chunking"
+                ),
             }
             
             # 对文本内容进行分块
@@ -63,6 +68,10 @@ class DocumentProcessor:
                 chunks = self.chunker.chunk_text(content)
                 file_result["chunks"] = chunks
                 file_result["chunk_count"] = len(chunks)
+                print(
+                    f"文件 {filepath} 使用分块策略: {file_result['chunk_strategy']}, "
+                    f"生成 {file_result['chunk_count']} 个文本块"
+                )
                 
                 # 计算每个块的长度
                 chunk_lengths = [len(''.join(chunk)) for chunk in chunks]

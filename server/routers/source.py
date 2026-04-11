@@ -1,4 +1,4 @@
-from typing import Dict
+from typing import Any, Dict
 from fastapi import APIRouter, HTTPException
 from models.schemas import SourceRequest, SourceResponse, SourceInfoResponse, SourceInfoBatchRequest, ContentBatchRequest
 from services.kg_service import get_source_content, get_source_file_info
@@ -21,7 +21,9 @@ async def source(request: SourceRequest):
         SourceResponse: 源内容响应
     """
     content = get_source_content(request.source_id)
-    return SourceResponse(content=content)
+    if isinstance(content, dict):
+        return SourceResponse(**content)
+    return SourceResponse(content=str(content), source_id=request.source_id)
 
 @router.post("/source_info")
 async def source_info(request: SourceRequest):

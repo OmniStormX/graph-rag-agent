@@ -5,6 +5,7 @@ from .utils import (
     generate_hash, 
     batch_process, 
     retry, 
+    is_non_retryable_llm_error,
     get_performance_stats, 
     print_performance_stats
 )
@@ -17,6 +18,7 @@ __all__ = [
     'generate_hash',
     'batch_process',
     'retry',
+    'is_non_retryable_llm_error',
     'get_performance_stats',
     'print_performance_stats'
 ]
