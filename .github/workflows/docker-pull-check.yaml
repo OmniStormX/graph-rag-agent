@@ -1,0 +1,75 @@
+name: Docker Pull Check
+
+on:
+  workflow_run:
+    workflows:
+      - Docker
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "要校验拉取的镜像 tag，默认使用 latest"
+        required: false
+        default: "latest"
+  schedule:
+    # 每天 UTC 02:00 做一次镜像可拉取性巡检。
+    - cron: "0 2 * * *"
+
+concurrency:
+  # 拉取校验不需要并发堆积，同一 ref 只保留最新一次。
+  group: docker-pull-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pull-check:
+    name: Pull Published Image On Ubuntu 22.04
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+
+    permissions:
+      contents: read
+      packages: read
+
+    # 仅在 Docker workflow 成功后继续做拉取校验，避免把构建失败误报成仓库拉取失败。
+    if: >
+      github.event_name != 'workflow_run' ||
+      (
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push'
+      )
+
+    steps:
+      - name: Resolve image tag
+        id: vars
+        env:
+          INPUT_TAG: ${{ github.event.inputs.image_tag }}
+          WORKFLOW_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          if [ -n "${INPUT_TAG}" ]; then
+            IMAGE_TAG="${INPUT_TAG}"
+          elif [ -n "${WORKFLOW_BRANCH}" ]; then
+            IMAGE_TAG="${WORKFLOW_BRANCH}"
+          else
+            IMAGE_TAG="latest"
+          fi
+
+          echo "image=ghcr.io/${{ github.repository_owner }}/graph-rag-app:${IMAGE_TAG}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${IMAGE_TAG}" >> "${GITHUB_OUTPUT}"
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull image from GHCR
+        run: |
+          docker pull "${{ steps.vars.outputs.image }}"
+
+      - name: Inspect pulled image
+        run: |
+          docker image inspect "${{ steps.vars.outputs.image }}"
+          docker image ls "${{ steps.vars.outputs.image }}"
+

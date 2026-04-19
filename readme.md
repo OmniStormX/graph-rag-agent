@@ -176,7 +176,111 @@ docker compose -f docker-compose.yaml -f docker-compose.dev.yaml up -d app
 - 默认不会拉起 Langfuse，减少额外容器开销
 - 依赖层缓存稳定后，后续联调明显更快
 
-### 6. 启动后端与前端
+### 6. 从镜像仓库拉取并运行
+
+如果你不准备在本地重新构建镜像，而是直接从 Docker 镜像仓库拉取项目镜像，可以按下面步骤操作。
+
+当前 GitHub Actions 会在指定分支 push 时自动构建并推送镜像到 GHCR，镜像名格式为：
+
+```text
+ghcr.io/<GitHub用户名或组织>/graph-rag-app:<tag>
+```
+
+常见 tag 示例：
+
+- `latest`
+- `main`
+- `develop`
+- `graphRAG-CSU`
+- 某次提交对应的 `sha-xxxxxxx`
+
+#### 1. 登录镜像仓库
+
+如果仓库镜像是私有的，需要先登录 GHCR：
+
+```bash
+echo <YOUR_GITHUB_TOKEN> | docker login ghcr.io -u <YOUR_GITHUB_USERNAME> --password-stdin
+```
+
+如果镜像仓库是公开的，这一步可以跳过。
+
+#### 2. 拉取镜像
+
+```bash
+docker pull ghcr.io/<GitHub用户名或组织>/graph-rag-app:latest
+```
+
+如果你希望固定版本，建议把 `latest` 改成具体 tag。
+
+#### 3. 准备运行时配置
+
+运行镜像前，请先准备以下内容：
+
+- `.env`：用于注入 LLM、Embedding、Neo4j、PostgreSQL 等环境变量
+- `runtime/admin/snapshots/`：如果希望容器首次启动时自动恢复图数据，需要把图快照文件一并挂载进去
+- `cache/`、`files/`、`runtime/`：建议挂载到宿主机，避免容器重建后丢失运行产物
+
+其中：
+
+- 应用会在启动时读取 `.env`
+- 当 Neo4j 是空库且 `GRAPH_RESTORE_ON_START=true` 时，会自动尝试从 `runtime/admin/snapshots/` 下最新快照恢复图数据
+
+#### 4. 运行单个应用容器
+
+如果 Neo4j、PostgreSQL、MCP 工具服务都已经在其他位置运行，可以直接启动主镜像：
+
+```bash
+docker run -d \
+  --name graph-rag-app \
+  --env-file .env \
+  -p 8000:8000 \
+  -p 8501:8501 \
+  -p 8502:8502 \
+  -v $(pwd)/cache:/app/cache \
+  -v $(pwd)/files:/app/files \
+  -v $(pwd)/runtime:/app/runtime \
+  ghcr.io/<GitHub用户名或组织>/graph-rag-app:latest
+```
+
+启动后访问：
+
+- 聊天前端：`http://localhost:8501`
+- 管理后台：`http://localhost:8502`
+- 后端 OpenAPI：`http://localhost:8000/docs`
+
+#### 5. 更推荐的方式：与 compose 一起运行
+
+如果你希望把 `postgres`、`neo4j`、`fluid-property-service` 与主应用一起编排，建议保留当前仓库内的 `docker-compose.yaml`，仅把 `app` 镜像来源改成仓库镜像，而不是本地 `build`。
+
+你可以参考这种写法：
+
+```yaml
+services:
+  app:
+    image: ghcr.io/<GitHub用户名或组织>/graph-rag-app:latest
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+      - "8501:8501"
+      - "8502:8502"
+    volumes:
+      - ./cache:/app/cache
+      - ./files:/app/files
+      - ./runtime:/app/runtime
+      - ./datasets:/app/datasets
+      - ./documents:/app/documents
+```
+
+然后执行：
+
+```bash
+docker compose up -d
+```
+
+这样做比单独 `docker run` 更稳定，因为依赖服务、网络、健康检查和恢复流程都能统一管理。
+
+### 7. 启动后端与前端
 
 ```bash
 uvicorn server.main:app --reload
@@ -190,7 +294,7 @@ make start-backend
 make start-frontend
 ```
 
-### 7. 启动后台管理界面
+### 8. 启动后台管理界面
 
 ```bash
 make start-admin-backend
