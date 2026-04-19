@@ -16,4 +16,10 @@ services:
       - ./frontend:/app/frontend
       - ./assets:/app/assets
       - ./docker:/app/docker
+      - ./tool_services:/app/tool_services
       - ./readme.md:/app/readme.md
+
+  fluid-property-service:
+    volumes:
+      # 开发模式下同步挂载工具服务源码，便于快速验证 MCP 接口。
+      - ./tool_services:/app/tool_services

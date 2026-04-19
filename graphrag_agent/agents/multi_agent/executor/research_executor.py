@@ -29,7 +29,7 @@ from graphrag_agent.agents.multi_agent.executor.base_executor import (
     TaskExecutionResult,
 )
 from graphrag_agent.agents.multi_agent.tools.evidence_tracker import get_evidence_tracker
-from graphrag_agent.search.tool_registry import TOOL_REGISTRY
+from graphrag_agent.search.tool_registry import TOOL_REGISTRY, available_extra_tools, create_extra_tool
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -46,9 +46,10 @@ class ResearchExecutor(BaseExecutor):
     def __init__(self, config: Optional[ExecutorConfig] = None) -> None:
         super().__init__(config)
         self._tool_cache: Dict[str, Any] = {}
+        self._extra_tool_factories = available_extra_tools()
 
     def can_handle(self, task_type: str) -> bool:
-        return task_type in self.SUPPORTED_TASKS
+        return task_type in self.SUPPORTED_TASKS or task_type in self._extra_tool_factories
 
     def execute_task(
         self,
@@ -209,9 +210,12 @@ class ResearchExecutor(BaseExecutor):
 
     def _get_tool_instance(self, task_type: str) -> Any:
         if task_type not in self._tool_cache:
-            if task_type not in TOOL_REGISTRY:
+            if task_type in TOOL_REGISTRY:
+                self._tool_cache[task_type] = TOOL_REGISTRY[task_type]()
+            elif task_type in self._extra_tool_factories:
+                self._tool_cache[task_type] = create_extra_tool(task_type)
+            else:
                 raise KeyError(f"未注册的研究工具: {task_type}")
-            self._tool_cache[task_type] = TOOL_REGISTRY[task_type]()
         return self._tool_cache[task_type]
 
     def _wrap_research_output(

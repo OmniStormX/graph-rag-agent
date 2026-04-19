@@ -4,6 +4,100 @@ import re
 from typing import Any, Dict, List, Tuple
 import streamlit as st
 
+
+_INLINE_POINTS_PATTERN = re.compile(
+    r"\{\{?\s*['\"]points['\"]\s*:\s*\[[\s\S]*?\]\s*\}\}?",
+    re.IGNORECASE,
+)
+_INLINE_DATA_PATTERN = re.compile(
+    r"\{\{?\s*['\"]data['\"]\s*:\s*\{[\s\S]*?\}\s*\}\}?",
+    re.IGNORECASE,
+)
+_TRAILING_REFERENCE_BLOCK_PATTERN = re.compile(
+    r"\n*#{1,4}\s*引用数据\s*\n+\s*(?:\{\{?[\s\S]*?\}\}?)*\s*$",
+    re.IGNORECASE,
+)
+_MATHISH_LINE_PATTERN = re.compile(
+    r"^[A-Za-z0-9_+\-*/=<>^%.,:;(){}\[\]（）\\|`~'\"△Δδ∂∫∑Σ∞≤≥±×÷·⋅\s]+$"
+)
+
+
+def _strip_legacy_inline_citations(content: str) -> str:
+    """移除正文中旧版 `points/data` 内联引用残留。"""
+    sanitized = _INLINE_POINTS_PATTERN.sub("", content)
+    sanitized = _INLINE_DATA_PATTERN.sub("", sanitized)
+    sanitized = _TRAILING_REFERENCE_BLOCK_PATTERN.sub("", sanitized)
+    # 收尾清理多余空白，避免删除引用后留下断裂空格。
+    sanitized = re.sub(r"[ \t]{2,}", " ", sanitized)
+    sanitized = re.sub(r"\n*#{1,4}\s*引用数据\s*$", "", sanitized, flags=re.IGNORECASE)
+    sanitized = re.sub(r"\n{3,}", "\n\n", sanitized)
+    return sanitized.strip()
+
+
+def _is_fragmented_math_line(line: str) -> bool:
+    """判断一行是否更像被拆散的公式片段而不是自然语言。"""
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if len(stripped) > 24:
+        return False
+    if re.search(r"[\u4e00-\u9fff]{2,}", stripped):
+        return False
+    if stripped.startswith(("-", "*", "1.", "2.", "3.", "#")):
+        return False
+    return bool(_MATHISH_LINE_PATTERN.fullmatch(stripped))
+
+
+def _compact_math_block(lines: List[str]) -> str:
+    """将多行碎裂公式压缩为单个 Markdown 数学块。"""
+    merged = " ".join(line.strip() for line in lines if line.strip())
+    merged = re.sub(r"\s+([,.;:)\]}}])", r"\1", merged)
+    merged = re.sub(r"([({\[])\s+", r"\1", merged)
+    merged = re.sub(r"\s{2,}", " ", merged).strip()
+    if not merged:
+        return ""
+    return f"$$ {merged} $$"
+
+
+def _normalize_fragmented_math(content: str) -> str:
+    """修复一行一个符号的碎裂公式展示问题。"""
+    lines = content.splitlines()
+    normalized_lines: List[str] = []
+    block: List[str] = []
+
+    def _flush_block() -> None:
+        """将缓存中的碎裂公式块写回结果。"""
+        nonlocal block
+        if len(block) >= 3 and any(
+            any(token in line for token in ("=", "Δ", "δ", "∫", "∑", "≤", "≥", "±"))
+            for line in block
+        ):
+            normalized_lines.append(_compact_math_block(block))
+        else:
+            normalized_lines.extend(block)
+        block = []
+
+    for line in lines:
+        if _is_fragmented_math_line(line):
+            block.append(line)
+            continue
+
+        _flush_block()
+        normalized_lines.append(line)
+
+    _flush_block()
+    normalized = "\n".join(normalized_lines)
+    return re.sub(r"\n{3,}", "\n\n", normalized).strip()
+
+
+def normalize_answer_for_display(content: str) -> str:
+    """统一清理回答展示层的引用残留与公式碎裂问题。"""
+    if not isinstance(content, str) or not content:
+        return content
+    normalized = _strip_legacy_inline_citations(content)
+    normalized = _normalize_fragmented_math(normalized)
+    return normalized
+
 def extract_source_ids(answer: str) -> List[str]:
     """从回答中提取引用的源ID"""
     source_ids = []
@@ -213,7 +307,7 @@ def render_answer_with_hover_citations(
     if not isinstance(content, str) or not content:
         return content
 
-    rendered = content
+    rendered = normalize_answer_for_display(content)
     placeholder_map: Dict[str, str] = {}
     evidence_order: List[str] = []
     evidence_index: Dict[str, int] = {}

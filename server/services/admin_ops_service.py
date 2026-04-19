@@ -36,20 +36,41 @@ class AdminOpsService:
         self._service_specs = {
             "backend": {
                 "label": "主后端",
-                "make_target": "start-backend",
                 "match_patterns": [
                     "uvicorn main:app --reload --port 8000",
                     "python -m uvicorn main:app --reload --port 8000",
+                    "uvicorn server.main:app --host 0.0.0.0 --port 8000",
+                    "python -m uvicorn server.main:app --host 0.0.0.0 --port 8000",
+                ],
+                "start_command": [
+                    "python",
+                    "-m",
+                    "uvicorn",
+                    "server.main:app",
+                    "--host",
+                    "0.0.0.0",
+                    "--port",
+                    "8000",
                 ],
                 "log_path": self._resolve_backend_log_path(),
                 "stoppable": True,
             },
             "frontend": {
                 "label": "主前端",
-                "make_target": "start-frontend",
                 "match_patterns": [
                     "streamlit run app.py",
                     "streamlit run frontend/app.py",
+                ],
+                "start_command": [
+                    "streamlit",
+                    "run",
+                    "frontend/app.py",
+                    "--server.address",
+                    "0.0.0.0",
+                    "--server.port",
+                    "8501",
+                    "--server.fileWatcherType",
+                    "none",
                 ],
                 "log_path": self._resolve_frontend_log_path(),
                 "stoppable": True,
@@ -111,7 +132,8 @@ class AdminOpsService:
             }
 
         return self._spawn_make_target(
-            target=spec["make_target"],
+            command=spec["start_command"],
+            target=target,
             log_path=spec["log_path"],
         ) | {"target": target}
 
@@ -144,23 +166,41 @@ class AdminOpsService:
             "stopped_pids": stopped_pids,
         }
 
-    def _spawn_make_target(self, *, target: str, log_path: Path) -> Dict[str, Any]:
-        """以后台进程方式启动 make 目标。"""
+    def _spawn_make_target(
+        self,
+        *,
+        command: List[str],
+        target: str,
+        log_path: Path,
+    ) -> Dict[str, Any]:
+        """以后台进程方式启动指定服务命令。"""
         log_path.parent.mkdir(parents=True, exist_ok=True)
         handle = open(log_path, "a", encoding="utf-8")
         process = subprocess.Popen(  # noqa: S603
-            ["make", target],
+            command,
             cwd=str(self._project_root),
             stdout=handle,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             start_new_session=True,
-            env=os.environ.copy(),
+            env={
+                **os.environ.copy(),
+                # 直接启动时显式补齐路径，兼容本地与容器两种运行模式。
+                "PYTHONPATH": os.environ.get(
+                    "PYTHONPATH",
+                    str(self._project_root),
+                ),
+                "FRONTEND_API_URL": os.environ.get(
+                    "FRONTEND_API_URL",
+                    "http://127.0.0.1:8000",
+                ),
+            },
         )
         handle.close()
         return {
             "status": "started",
-            "make_target": target,
+            "command": command,
+            "service_target": target,
             "pid": process.pid,
             "log_path": str(log_path),
         }

@@ -26,6 +26,7 @@ from graphrag_agent.agents.multi_agent.executor.base_executor import (
 from graphrag_agent.search.tool_registry import (
     TOOL_REGISTRY,
     EXTRA_TOOL_FACTORIES,
+    available_extra_tools,
     create_extra_tool,
 )
 from graphrag_agent.agents.multi_agent.tools.evidence_tracker import get_evidence_tracker
@@ -49,7 +50,7 @@ class RetrievalExecutor(BaseExecutor):
     ) -> None:
         super().__init__(config)
         self._tool_registry = tool_registry or TOOL_REGISTRY
-        self._extra_factories = extra_tool_factories or EXTRA_TOOL_FACTORIES
+        self._extra_factories = extra_tool_factories or available_extra_tools()
         self._tool_cache: Dict[str, Any] = {}
         self._extra_cache: Dict[str, Any] = {}
 

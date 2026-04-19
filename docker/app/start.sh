@@ -25,6 +25,8 @@ export PYTHONPATH="${PYTHONPATH:-/app:/app/server:/app/frontend}"
 
 cd /app
 
+python /app/docker/app/restore_graph.py
+
 python -m uvicorn server.main:app --host "${SERVER_HOST}" --port "${SERVER_PORT}" --workers "${SERVER_WORKERS}" &
 BACKEND_PID=$!
 

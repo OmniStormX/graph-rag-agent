@@ -17,6 +17,7 @@ from graphrag_agent.config.prompts import (
     REDUCE_SYSTEM_PROMPT,
 )
 from graphrag_agent.config.settings import response_type
+from graphrag_agent.search.tool_registry import get_langchain_extra_tools
 from graphrag_agent.search.tool.global_search_tool import GlobalSearchTool
 from graphrag_agent.search.tool.fluid_property_tool import FluidPropertyTool
 from graphrag_agent.search.tool.local_search_tool import LocalSearchTool
@@ -42,7 +43,7 @@ class GraphAgent(BaseAgent):
         return [
             self.local_tool.get_tool(),
             self.global_tool.get_tool(),
-            self.fluid_property_tool.get_tool(),
+            *get_langchain_extra_tools(),
         ]
 
     def _add_retrieval_edges(self, workflow):

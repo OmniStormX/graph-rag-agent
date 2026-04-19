@@ -67,8 +67,8 @@ COPY graphrag_agent ./graphrag_agent
 COPY server ./server
 COPY frontend ./frontend
 COPY assets ./assets
-COPY datasets ./datasets
 COPY files ./files
+COPY tool_services ./tool_services
 COPY docker ./docker
 COPY readme.md ./readme.md
 

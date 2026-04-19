@@ -41,6 +41,7 @@
 - `fluid_property_calc` 支持流体物性计算
 - 当前支持工质别名包括 `Water`、`steam`、`H2O`、`水`、`水蒸气`、`蒸汽`、`Air`、`R134a`、`Ammonia`、`CO2`
 - 支持状态量 `T`、`P`、`H`、`S`、`D`、`Q`
+- 已支持通过 MCP 风格 HTTP 目录把外部计算工具自动接入 Agent 工具集
 
 ## 目录结构
 
@@ -195,6 +196,160 @@ make start-frontend
 make start-admin-backend
 make start-admin-frontend
 ```
+
+## 自制 MCP 工具接入流程
+
+当前项目已经支持一种轻量的 MCP 风格工具接入机制。核心思想是：
+
+- 外部工具服务只需要暴露工具描述和调用接口
+- 主项目启动后会自动读取工具目录
+- Agent 会把这些工具自动加入 `Tools`，无需再手工改每个 Agent 的 `_setup_tools`
+
+这套机制适合把热力计算、物性查询、经验公式计算、设备选型校核这类“独立、定量、可服务化”的能力拆出去。
+
+### 1. 接口协议
+
+你的工具服务至少需要提供两个 HTTP 接口：
+
+```text
+GET  /tools
+POST /tools/{tool_name}/invoke
+```
+
+其中 `GET /tools` 返回工具目录，最小返回格式如下：
+
+```json
+{
+  "tools": [
+    {
+      "name": "my_custom_calc",
+      "description": "这是一个自定义计算工具，用于根据输入参数执行定量计算。",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "number",
+            "description": "输入参数 x"
+          },
+          "y": {
+            "type": "number",
+            "description": "输入参数 y"
+          }
+        },
+        "required": ["x", "y"]
+      },
+      "invoke_path": "/tools/my_custom_calc/invoke",
+      "tags": ["calculation", "custom"]
+    }
+  ]
+}
+```
+
+`POST /tools/my_custom_calc/invoke` 的返回建议兼容项目当前工具层协议：
+
+```json
+{
+  "success": true,
+  "answer": "计算成功: z=42.0",
+  "results": {
+    "z": 42.0
+  },
+  "metadata": {
+    "notes": []
+  },
+  "error": null,
+  "retrieval_results": []
+}
+```
+
+### 2. 项目如何自动发现工具
+
+主项目通过以下环境变量发现外部工具服务：
+
+```env
+MCP_TOOL_ENDPOINTS='http://127.0.0.1:8010,http://127.0.0.1:8020'
+```
+
+或：
+
+```env
+MCP_TOOL_ENDPOINTS='["http://127.0.0.1:8010","http://127.0.0.1:8020"]'
+```
+
+如果你接的是流体物性独立服务，也可以单独配置：
+
+```env
+FLUID_PROPERTY_SERVICE_URL='http://127.0.0.1:8010'
+```
+
+当前实现位置：
+
+- MCP 发现入口：[graphrag_agent/mcp/discovery.py](/home/omnistorm/桌面/code/project/graph-RAG/graphrag_agent/mcp/discovery.py:1)
+- MCP 适配层：[graphrag_agent/mcp/adapter.py](/home/omnistorm/桌面/code/project/graph-RAG/graphrag_agent/mcp/adapter.py:1)
+- 工具统一注册入口：[graphrag_agent/search/tool_registry.py](/home/omnistorm/桌面/code/project/graph-RAG/graphrag_agent/search/tool_registry.py:1)
+
+### 3. 最小实现示例
+
+你可以参考当前已经拆出去的流体物性服务：
+
+- 服务入口：[tool_services/fluid_property_service/app.py](/home/omnistorm/桌面/code/project/graph-RAG/tool_services/fluid_property_service/app.py:1)
+- 计算核心：[tool_services/fluid_property_service/core.py](/home/omnistorm/桌面/code/project/graph-RAG/tool_services/fluid_property_service/core.py:1)
+
+启动方式：
+
+```bash
+uvicorn tool_services.fluid_property_service.app:app --host 0.0.0.0 --port 8010
+```
+
+然后在主项目 `.env` 中加入：
+
+```env
+MCP_TOOL_ENDPOINTS='http://127.0.0.1:8010'
+FLUID_PROPERTY_SERVICE_URL='http://127.0.0.1:8010'
+```
+
+此时主项目内的 Agent 会自动发现 `fluid_property_calc`，并加入工具集。
+
+### 4. 自己新增一个工具的推荐步骤
+
+1. 在独立目录下实现一个 FastAPI 服务，建议放在 `tool_services/<your_service>/`
+2. 定义 `GET /tools`，准确描述工具名称、用途和 `input_schema`
+3. 定义 `POST /tools/<tool_name>/invoke`，返回统一结构
+4. 先用 `curl` 或 Postman 验证该服务可独立调用
+5. 把服务地址写入 `.env` 的 `MCP_TOOL_ENDPOINTS`
+6. 重启主项目后端，让 Agent 重新发现工具
+7. 增加 `unittest`，至少覆盖目录接口和调用接口
+
+### 5. Agent 自动装配的边界
+
+当前自动装配依赖两个关键字段：
+
+- `name`：工具唯一名称，供模型函数调用时引用
+- `description`：工具用途说明，供模型判断是否应调用该工具
+
+`input_schema` 会被适配成 LangChain 工具参数模型，因此建议：
+
+- 字段名简洁稳定，避免频繁变更
+- `description` 写清单位、取值范围、必填条件
+- 对定量工具明确说明输入输出的工程语义
+
+如果工具返回结构化结果，建议至少包含：
+
+- `success`
+- `answer`
+- `results`
+- `metadata`
+- `error`
+
+这样可以同时兼容普通 Agent 调用和多智能体执行器调用。
+
+### 6. 工程建议
+
+- 高耗时计算工具优先独立服务化，不要直接塞进主进程
+- 工具服务要做到无状态，便于后续 Docker 化和 Kubernetes 横向扩容
+- 输入输出协议保持稳定，版本升级时尽量新增字段，不要直接改旧字段语义
+- 如果后续工具数量继续增加，建议把 `MCP_TOOL_ENDPOINTS` 进一步收敛为统一工具网关
+- 如果部署到 Windows，优先采用“主应用容器 + 若干工具服务容器”模式，比把所有定量工具都耦合进主镜像更易维护
 
 ## 常用命令
 

@@ -15,6 +15,8 @@ services:
       GRAPH_ADMIN_METADATA_DSN: postgresql://postgres:postgres@postgres:5432/graphrag_admin
       FRONTEND_API_URL: http://127.0.0.1:8000
       ADMIN_FRONTEND_API_URL: http://127.0.0.1:8000
+      MCP_TOOL_ENDPOINTS: ${MCP_TOOL_ENDPOINTS:-http://fluid-property-service:8010}
+      FLUID_PROPERTY_SERVICE_URL: ${FLUID_PROPERTY_SERVICE_URL:-http://fluid-property-service:8010}
       SERVER_HOST: 0.0.0.0
       SERVER_PORT: 8000
       SERVER_WORKERS: ${SERVER_WORKERS:-1}
@@ -35,12 +37,48 @@ services:
         condition: service_healthy
       neo4j:
         condition: service_started
+      fluid-property-service:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "/app/docker/app/healthcheck.py"]
       interval: 30s
       timeout: 10s
       retries: 5
       start_period: 60s
+    restart: unless-stopped
+
+  fluid-property-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+      args:
+        INSTALL_LOCAL_NLP: ${INSTALL_LOCAL_NLP:-false}
+    container_name: graph-rag-fluid-property-service
+    env_file:
+      - .env
+    environment:
+      PYTHONPATH: /app:/app/server:/app/frontend
+    command:
+      - python
+      - -m
+      - uvicorn
+      - tool_services.fluid_property_service.app:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8010"
+    expose:
+      - "8010"
+    volumes:
+      # 工具服务与主应用共享代码目录，便于统一发布与排查。
+      - ./tool_services:/app/tool_services
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8010/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
     restart: unless-stopped
 
   postgres:
