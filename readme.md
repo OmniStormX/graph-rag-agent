@@ -280,7 +280,7 @@ MCP_TOOL_ENDPOINTS='["http://127.0.0.1:8010","http://127.0.0.1:8020"]'
 
 ```env
 FLUID_PROPERTY_SERVICE_URL='http://127.0.0.1:8010'
-```
+``` 
 
 当前实现位置：
 
