@@ -25,6 +25,13 @@ jobs:
       LANGFUSE_ENABLED: "false"
       PYTHONUNBUFFERED: "1"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      # 这组 smoke test 只要求模块可导入，不依赖真实 Neo4j 连通性。
+      NEO4J_URI: "bolt://127.0.0.1:7687"
+      NEO4J_USERNAME: "neo4j"
+      NEO4J_PASSWORD: "test-password"
+      NEO4J_MAX_POOL_SIZE: "10"
+      NEO4J_REFRESH_SCHEMA: "false"
+      GRAPH_ADMIN_ENABLED: "false"
 
     steps:
       - name: Checkout repository
@@ -75,4 +82,3 @@ jobs:
             test.test_stream_integration \
             test.test_agent_tool_call_sanitization \
             test.test_observability
-
