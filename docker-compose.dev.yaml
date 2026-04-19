@@ -1,0 +1,19 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+      args:
+        INSTALL_LOCAL_NLP: ${INSTALL_LOCAL_NLP:-false}
+    environment:
+      SERVER_WORKERS: 1
+      FASTAPI_WORKERS: 1
+    volumes:
+      # 开发模式直接挂载源码，避免每次改动都重建镜像。
+      - ./graphrag_agent:/app/graphrag_agent
+      - ./server:/app/server
+      - ./frontend:/app/frontend
+      - ./assets:/app/assets
+      - ./docker:/app/docker
+      - ./readme.md:/app/readme.md

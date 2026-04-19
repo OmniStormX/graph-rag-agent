@@ -85,6 +85,12 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+如果你需要本地 NLP/向量模型能力（如 HanLP、本地 SentenceTransformer，通常会间接安装 `torch`），再额外执行：
+
+```bash
+pip install -r requirements.local_nlp.txt
+```
+
 ### 2. 配置环境变量
 
 复制 `.env.example` 为 `.env`，至少确认以下配置：
@@ -122,7 +128,54 @@ docker compose up -d postgres neo4j
 docker compose up -d
 ```
 
-### 4. 启动后端与前端
+### 4. 使用 Docker 一键启动完整应用
+
+如果你希望把当前项目应用层完整封装到一个镜像里，可以直接构建并启动 `app` 服务。该镜像会在单容器内同时拉起：
+
+- FastAPI 后端：`8000`
+- Streamlit 聊天前端：`8501`
+- Streamlit 管理后台：`8502`
+
+启动前请先准备 `.env`，并确认其中的 LLM、Embedding 等外部依赖可用。
+
+```bash
+docker compose up -d --build app
+```
+
+推荐直接拉起整套栈：
+
+```bash
+docker compose up -d --build
+```
+
+启动后访问：
+
+- 聊天前端：`http://localhost:8501`
+- 管理后台：`http://localhost:8502`
+- 后端 OpenAPI：`http://localhost:8000/docs`
+- Neo4j Browser：`http://localhost:7474`
+
+如果需要可观测性栈（Langfuse），再显式启用对应 profile：
+
+```bash
+docker compose --profile observability up -d
+```
+
+### 5. Docker 开发模式
+
+如果你是在本地频繁改代码，建议使用开发态 compose，直接挂载源码，避免每次都重建镜像：
+
+```bash
+docker compose -f docker-compose.yaml -f docker-compose.dev.yaml up -d app
+```
+
+这种模式下：
+
+- Python 代码修改后只需要重启容器内进程或重新启动服务
+- 默认不会拉起 Langfuse，减少额外容器开销
+- 依赖层缓存稳定后，后续联调明显更快
+
+### 6. 启动后端与前端
 
 ```bash
 uvicorn server.main:app --reload
@@ -136,7 +189,7 @@ make start-backend
 make start-frontend
 ```
 
-### 5. 启动后台管理界面
+### 7. 启动后台管理界面
 
 ```bash
 make start-admin-backend

@@ -1,0 +1,22 @@
+.git
+.gitignore
+.venv
+.vscode
+.streamlit
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.log
+.DS_Store
+
+# 运行期缓存与构建产物不打进镜像，避免镜像体积失控。
+cache/
+server/cache/
+runtime/
+pdf/
+datasets/
+documents/
+
+# 本地机密配置不写入镜像，容器运行时通过 env_file 注入。
+.env

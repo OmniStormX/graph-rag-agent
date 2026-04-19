@@ -1,11 +1,11 @@
 import uvicorn
 from fastapi import FastAPI
 from graphrag_agent.config.settings import GRAPH_ADMIN_ENABLED
-from routers import api_router
-from server_config.database import get_db_manager
-from server_config.settings import UVICORN_CONFIG
-from services.admin_metadata_service import metadata_service
-from services.agent_service import agent_manager
+from server.routers import api_router
+from server.server_config.database import get_db_manager
+from server.server_config.settings import UVICORN_CONFIG
+from server.services.admin_metadata_service import metadata_service
+from server.services.agent_service import agent_manager
 
 # 初始化 FastAPI 应用
 app = FastAPI(title="知识图谱问答系统", description="基于知识图谱的智能问答系统后端API")
@@ -39,4 +39,5 @@ def shutdown_event():
 
 # 启动服务器
 if __name__ == "__main__":
-    uvicorn.run("main:app", **UVICORN_CONFIG)
+    # 使用包路径启动，避免容器和本地脚本入口的导入行为不一致。
+    uvicorn.run("server.main:app", **UVICORN_CONFIG)

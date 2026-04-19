@@ -43,7 +43,7 @@ def preload_sentence_transformer_models(models: Optional[List[str]] = None) -> N
                 print(f"加载模型 {model_name} 失败: {e}")
 
     except ImportError as e:
-        print(f"未安装sentence_transformers，跳过预加载: {e}")
+        print(f"未安装sentence_transformers/torch，跳过预加载: {e}")
 
 
 def preload_cache_embedding_model() -> None:

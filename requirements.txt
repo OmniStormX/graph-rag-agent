@@ -5,7 +5,6 @@ fastapi==0.115.11
 faiss-cpu==1.11.0
 google-auth==2.38.0
 graphdatascience==1.12
-hanlp==2.1.1
 httplib2==0.22.0
 jieba==0.42.1
 langchain==0.3.21
@@ -34,7 +33,6 @@ Requests==2.32.3
 rich==13.9.4
 schedule==1.2.2
 scikit-learn==1.6.1
-sentence_transformers==4.1.0
 setuptools==75.8.0
 shutup==0.2.0
 sseclient-py==1.7.2
@@ -48,16 +46,5 @@ textract==1.6.3
 # windows
 # pywin32>=302
 
-# 以下是GRPO训练所需的额外依赖， vllm在windows下不可用
-# unsloth==2025.3.19
-# unsloth_zoo==2025.3.17
-# trl==0.14.0
-# peft==0.15.1
-# transformers==4.49.0
-# torch==2.5.1
-# tiktoken==0.9.0
-# networkx==3.4.2
-# vllm==0.6.5
-# triton==3.1.0
-# regex==2024.11.6
-# tenacity==9.0.0
+# 如需本地 NLP/向量模型（会间接安装 torch），请额外安装：
+#   pip install -r requirements.local_nlp.txt

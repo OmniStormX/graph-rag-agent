@@ -203,7 +203,7 @@ SENTENCE_TRANSFORMER_MODELS = [
     if item.strip()
 ]  # 预加载的本地模型列表
 CACHE_EMBEDDING_PROVIDER = os.getenv(
-    "CACHE_EMBEDDING_PROVIDER", "sentence_transformer"
+    "CACHE_EMBEDDING_PROVIDER", "openai"
 ).lower()
 CACHE_SENTENCE_TRANSFORMER_MODEL = os.getenv(
     "CACHE_SENTENCE_TRANSFORMER_MODEL", "all-MiniLM-L6-v2"

@@ -131,7 +131,8 @@ entity_alignment_prompt = """
 Given these entities that should refer to the same concept:
 {entity_desc}
 
-Which entity ID best represents the canonical form? Reply with only the entity ID."""
+Which entity ID best represents the canonical form? Reply with only the entity ID.
+"""
 
 __all__ = [
     "system_template_build_graph",

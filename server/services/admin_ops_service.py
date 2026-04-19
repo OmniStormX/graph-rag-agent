@@ -9,6 +9,8 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, List
 
+import psutil
+
 from graphrag_agent.config.settings import (
     CACHE_DIR,
     GRAPH_ADMIN_BACKEND_LOG_PATH,
@@ -165,25 +167,42 @@ class AdminOpsService:
 
     def _collect_process_table(self) -> List[Dict[str, Any]]:
         """采集当前系统进程列表。"""
-        completed = subprocess.run(  # noqa: S603
-            ["ps", "-eo", "pid=,args="],
-            cwd=str(self._project_root),
-            capture_output=True,
-            text=True,
-            check=True,
-        )
         process_rows: List[Dict[str, Any]] = []
-        for line in completed.stdout.splitlines():
-            row = line.strip()
-            if not row:
-                continue
-            parts = row.split(maxsplit=1)
-            if len(parts) != 2:
-                continue
-            pid_str, command = parts
-            if not pid_str.isdigit():
-                continue
-            process_rows.append({"pid": int(pid_str), "command": command})
+        try:
+            # 优先使用 psutil，避免容器精简镜像中缺失 `ps` 命令导致 500。
+            for process in psutil.process_iter(["pid", "cmdline"]):
+                try:
+                    pid = process.info.get("pid")
+                    cmdline = process.info.get("cmdline") or []
+                    if not pid or not cmdline:
+                        continue
+                    command = " ".join(part for part in cmdline if part)
+                    if not command:
+                        continue
+                    process_rows.append({"pid": int(pid), "command": command})
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            return process_rows
+        except Exception:
+            # 回退到系统命令，兼容本地非容器场景。
+            completed = subprocess.run(  # noqa: S603
+                ["ps", "-eo", "pid=,args="],
+                cwd=str(self._project_root),
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            for line in completed.stdout.splitlines():
+                row = line.strip()
+                if not row:
+                    continue
+                parts = row.split(maxsplit=1)
+                if len(parts) != 2:
+                    continue
+                pid_str, command = parts
+                if not pid_str.isdigit():
+                    continue
+                process_rows.append({"pid": int(pid_str), "command": command})
         return process_rows
 
     def _match_processes(

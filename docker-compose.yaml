@@ -1,4 +1,48 @@
 services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+      args:
+        INSTALL_LOCAL_NLP: ${INSTALL_LOCAL_NLP:-false}
+    container_name: graph-rag-app
+    env_file:
+      - .env
+    environment:
+      # 容器内服务发现统一走 compose 服务名，避免再写 localhost。
+      NEO4J_URI: neo4j://neo4j:7687
+      GRAPH_ADMIN_METADATA_DSN: postgresql://postgres:postgres@postgres:5432/graphrag_admin
+      FRONTEND_API_URL: http://127.0.0.1:8000
+      ADMIN_FRONTEND_API_URL: http://127.0.0.1:8000
+      SERVER_HOST: 0.0.0.0
+      SERVER_PORT: 8000
+      SERVER_WORKERS: ${SERVER_WORKERS:-1}
+      FASTAPI_WORKERS: ${FASTAPI_WORKERS:-1}
+    ports:
+      - "8000:8000"
+      - "8501:8501"
+      - "8502:8502"
+    volumes:
+      # 数据目录保留在宿主机，便于图谱增量构建和问题排查。
+      - ./cache:/app/cache
+      - ./files:/app/files
+      - ./runtime:/app/runtime
+      - ./datasets:/app/datasets
+      - ./documents:/app/documents
+    depends_on:
+      postgres:
+        condition: service_healthy
+      neo4j:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "/app/docker/app/healthcheck.py"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+
   postgres:
     image: postgres:16
     ports:
@@ -11,6 +55,11 @@ services:
       PGTZ: UTC
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d graphrag_admin"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
     restart: unless-stopped
 
   neo4j:
@@ -26,10 +75,15 @@ services:
       NEO4J_dbms_memory_heap_max__size: "2G"
       NEO4J_dbms_memory_pagecache_size: "1G"
       NEO4J_apoc_trigger_enabled: "true"
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+      - neo4j_plugins:/plugins
     restart: unless-stopped
 
   # Langfuse 独立依赖栈，避免和 GraphRAG 后台元数据库互相污染。
   langfuse-postgres:
+    profiles: ["observability"]
     image: postgres:16
     environment:
       POSTGRES_DB: langfuse
@@ -47,6 +101,7 @@ services:
     restart: unless-stopped
 
   langfuse-clickhouse:
+    profiles: ["observability"]
     image: clickhouse/clickhouse-server:24.3-alpine
     environment:
       CLICKHOUSE_DB: default
@@ -68,6 +123,7 @@ services:
     restart: unless-stopped
 
   langfuse-redis:
+    profiles: ["observability"]
     image: redis:7-alpine
     command:
       - redis-server
@@ -85,6 +141,7 @@ services:
     restart: unless-stopped
 
   langfuse-minio:
+    profiles: ["observability"]
     image: cgr.dev/chainguard/minio
     entrypoint: /bin/sh
     command:
@@ -106,6 +163,7 @@ services:
     restart: unless-stopped
 
   langfuse-web:
+    profiles: ["observability"]
     image: langfuse/langfuse:3
     depends_on:
       langfuse-postgres:
@@ -162,6 +220,7 @@ services:
 
   # Worker 负责异步消费队列和落盘对象存储事件。
   langfuse-worker:
+    profiles: ["observability"]
     image: langfuse/langfuse-worker:3
     depends_on:
       langfuse-postgres:
@@ -206,6 +265,9 @@ services:
     restart: unless-stopped
 
 volumes:
+  neo4j_data:
+  neo4j_logs:
+  neo4j_plugins:
   postgres_data:
   langfuse_postgres_data:
   langfuse_clickhouse_data:

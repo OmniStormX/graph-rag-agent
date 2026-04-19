@@ -1,7 +1,6 @@
 import numpy as np
 from abc import ABC, abstractmethod
 from typing import List, Union
-from sentence_transformers import SentenceTransformer
 import threading
 from pathlib import Path
 
@@ -105,6 +104,15 @@ class SentenceTransformerEmbedding(EmbeddingProvider):
         cache_path = Path(cache_dir)
         cache_path.mkdir(parents=True, exist_ok=True)
 
+        # 延迟导入 sentence_transformers，避免 OpenAI 模式下仍然强制依赖 torch。
+        try:
+            from sentence_transformers import SentenceTransformer
+        except ImportError as exc:
+            raise ImportError(
+                "当前 CACHE_EMBEDDING_PROVIDER=sentence_transformer，但未安装 "
+                "sentence_transformers 及其 torch 依赖。"
+            ) from exc
+
         # 加载模型，指定缓存目录
         self.model = SentenceTransformer(model_name, cache_folder=str(cache_path))
         self._dimension = None
@@ -133,7 +141,9 @@ def get_cache_embedding_provider() -> EmbeddingProvider:
 
     if provider_type == 'openai':
         return OpenAIEmbeddingProvider()
-    else:
-        # 使用sentence transformer
+
+    if provider_type == 'sentence_transformer':
         model_name = CACHE_SENTENCE_TRANSFORMER_MODEL
         return SentenceTransformerEmbedding(model_name=model_name, cache_dir=MODEL_CACHE_DIR)
+
+    raise ValueError(f"不支持的 CACHE_EMBEDDING_PROVIDER: {provider_type}")
