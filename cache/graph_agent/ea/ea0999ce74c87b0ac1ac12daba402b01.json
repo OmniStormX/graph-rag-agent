@@ -1,0 +1,14 @@
+{
+  "content": "### 温度与温差在热力学中的定义与使用规范\n\n#### 定义与对象\n温度是描述系统热状态的基本物理量，而温差（$\\Delta T$）则是驱动传热过程的关键变量。在热力学中，存在绝对温标（如开尔文 K 和兰金 R）与相对温标（如摄氏 °C 和华氏 °F）之分。对于**温度变化量**，不同温标之间具有等价性：  \n$$\n\\Delta T (\\text{K}) = \\Delta T (^\\circ\\text{C}) \\quad \\text{[[ref:温差等价性|0d58befd02d6ca2882da49719be8372fa7c94543]]}\n$$  \n$$\n\\Delta T (\\text{R}) = \\Delta T (^\\circ\\text{F}) \\quad \\text{[[ref:温差等价性|0d58befd02d6ca2882da49719be8372fa7c94543]]}\n$$  \n这意味着，在涉及温度差的热力学关系（如 $a = b \\Delta T$）中，使用 K 或 °C、R 或 °F 是等效的。\n\n#### 机理与过程\n热量传递的根本驱动力是温差，即热量总是从高温系统自发流向低温系统 [[ref:热量传递方向|Relationships-5]]。因此，在传热分析中，温差的准确表达至关重要。然而，当热力学关系式涉及**绝对温度**（如理想气体状态方程 $PV = nRT$ 或辐射传热中的 $T^4$ 项），必须使用绝对温标（K 或 R），否则会导致错误结果 [[ref:绝对温度要求|0d58befd02d6ca2882da49719be8372fa7c94543]]。\n\n#### 关键因素\n- **是否为温度差 vs. 绝对温度**：这是决定单位选择的核心判据。若公式仅含 $\\Delta T$，则 °C 与 K 可互换；若含 $T$，则必须用 K。\n- **单位制一致性**：SI 系统中推荐统一使用 K，因其在所有热力学关系中均适用，而 °C 仅适用于温差场景 [[ref:安全使用K|0d58befd02d6ca2882da49719be8372fa7c94543]]。\n- **工程转换注意**：学生和工程师在进行单位换算时，需首先判断处理的是“温度值”还是“温度变化值”，避免混淆导致计算错误 [[ref:单位转换注意事项|0d58befd02d6ca2882da49719be8372fa7c94543]]。\n\n#### 工程结论\n在工程热力学建模与计算中，为确保普适性和避免错误，**应优先采用开尔文温标（K）表示温度**，尤其是在涉及状态方程、熵变或辐射传热等依赖绝对温度的场合。而在仅涉及传热速率（如牛顿冷却定律 $q = U A \\Delta T$）时，可灵活使用 °C 或 K，因其数值相等。此外，热传递的方向始终由高温指向低温，这一原理不依赖于温标选择，但依赖于温差的存在 [[ref:传热驱动力|Relationships-4]]。\n\n#### 引用数据\n{'data': {'Entities': [4], 'Reports': [], 'Relationships': [4, 5, 13], 'Chunks': ['0d58befd02d6ca2882da49719be8372fa7c94543']}}",
+  "metadata": {
+    "created_at": 1776589280.366289,
+    "quality_score": 0,
+    "user_verified": false,
+    "access_count": 0,
+    "fast_path_eligible": false,
+    "last_accessed": null,
+    "similarity_score": null,
+    "matched_via_vector": false,
+    "original_query": null
+  }
+}
