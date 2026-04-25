@@ -83,6 +83,17 @@ Langfuse 本地默认初始化账号：
 - 这些默认值仅适合本地开发，生产环境务必改掉 `.env` 中的 Langfuse 密钥与口令
 - 若你只想启动图谱服务、不想启动 Langfuse，可使用 `docker compose up -d postgres neo4j`
 
+## 使用已发布镜像启动
+
+如果不需要在本地构建镜像，可以直接拉取发布到 GHCR 的项目镜像：
+
+```bash
+docker pull ghcr.io/omnistormx/graph-rag-app:graphRAG-CSU
+docker compose -f docker-compose.image.yaml up -d
+```
+
+`docker-compose.image.yaml` 使用同一个项目镜像分别启动主应用和流体物性工具服务，同时编排 Neo4j 与 PostgreSQL。`latest` 只会在默认分支发布成功后生成；生产环境建议固定具体 tag 或提交 SHA，避免不可预期升级。
+
 ## 环境搭建
 
 ```bash

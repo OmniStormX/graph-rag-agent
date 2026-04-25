@@ -129,7 +129,7 @@ docker compose up -d postgres neo4j
 docker compose up -d
 ```
 
-### 4. 使用 Docker 一键启动完整应用
+### 4. 本地构建 Docker 镜像并启动
 
 如果你希望把当前项目应用层完整封装到一个镜像里，可以直接构建并启动 `app` 服务。该镜像会在单容器内同时拉起：
 
@@ -162,7 +162,81 @@ docker compose up -d --build
 docker compose --profile observability up -d
 ```
 
-### 5. Docker 开发模式
+### 5. 直接拉取 Docker 镜像运行
+
+项目应用层会发布为一个 Docker 镜像，镜像内包含：
+
+- FastAPI 后端
+- Streamlit 聊天前端
+- Streamlit 管理后台
+- 内置的流体物性工具服务代码
+
+当前 `graphRAG-CSU` 分支的默认发布地址：
+
+```text
+ghcr.io/omnistormx/graph-rag-app:graphRAG-CSU
+```
+
+使用者只需要拉取这一份项目镜像：
+
+```bash
+docker pull ghcr.io/omnistormx/graph-rag-app:graphRAG-CSU
+```
+
+说明：`latest` 只会在默认分支发布成功后生成；当前分支请使用 `graphRAG-CSU` 或某次提交对应的 `sha-xxxxxxx`。
+
+如果镜像仓库是私有的，先登录 GHCR：
+
+```bash
+echo <YOUR_GITHUB_TOKEN> | docker login ghcr.io -u <YOUR_GITHUB_USERNAME> --password-stdin
+```
+
+#### 5.1 推荐方式：镜像 + Docker 编排依赖
+
+GraphRAG 运行时仍依赖 Neo4j 和 PostgreSQL。行业内不建议把数据库塞进同一个业务镜像；更稳定的做法是“一个项目镜像 + 数据库容器 + 持久化卷”。仓库提供了 `docker-compose.image.yaml`，它不会构建本地代码，只会使用已发布镜像。
+
+准备 `.env` 后执行：
+
+```bash
+docker compose -f docker-compose.image.yaml up -d
+```
+
+如需固定版本或使用私有镜像地址，可以覆盖 `GRAPH_RAG_IMAGE`：
+
+```bash
+GRAPH_RAG_IMAGE=ghcr.io/omnistormx/graph-rag-app:sha-xxxxxxx \
+  docker compose -f docker-compose.image.yaml up -d
+```
+
+启动后访问：
+
+- 聊天前端：`http://localhost:8501`
+- 管理后台：`http://localhost:8502`
+- 后端 OpenAPI：`http://localhost:8000/docs`
+- Neo4j Browser：`http://localhost:7474`
+
+#### 5.2 仅运行项目应用容器
+
+如果 Neo4j、PostgreSQL、MCP 工具服务已经在其他位置运行，可以只启动项目应用容器。此时 `.env` 中必须配置可达的 `NEO4J_URI`、`GRAPH_ADMIN_METADATA_DSN`、`MCP_TOOL_ENDPOINTS` 等地址。
+
+```bash
+docker run -d \
+  --name graph-rag-app \
+  --env-file .env \
+  -p 8000:8000 \
+  -p 8501:8501 \
+  -p 8502:8502 \
+  -v $(pwd)/cache:/app/cache \
+  -v $(pwd)/files:/app/files \
+  -v $(pwd)/runtime:/app/runtime \
+  -v $(pwd)/datasets:/app/datasets \
+  -v $(pwd)/documents:/app/documents \
+  ghcr.io/omnistormx/graph-rag-app:graphRAG-CSU
+```
+
+注意：单独 `docker run` 不会自动启动 Neo4j、PostgreSQL 和流体工具服务，适合已有外部依赖的部署环境。
+
+### 6. Docker 开发模式
 
 如果你是在本地频繁改代码，建议使用开发态 compose，直接挂载源码，避免每次都重建镜像：
 
@@ -175,110 +249,6 @@ docker compose -f docker-compose.yaml -f docker-compose.dev.yaml up -d app
 - Python 代码修改后只需要重启容器内进程或重新启动服务
 - 默认不会拉起 Langfuse，减少额外容器开销
 - 依赖层缓存稳定后，后续联调明显更快
-
-### 6. 从镜像仓库拉取并运行
-
-如果你不准备在本地重新构建镜像，而是直接从 Docker 镜像仓库拉取项目镜像，可以按下面步骤操作。
-
-当前 GitHub Actions 会在指定分支 push 时自动构建并推送镜像到 GHCR，镜像名格式为：
-
-```text
-ghcr.io/<GitHub用户名或组织>/graph-rag-app:<tag>
-```
-
-常见 tag 示例：
-
-- `latest`
-- `main`
-- `develop`
-- `graphRAG-CSU`
-- 某次提交对应的 `sha-xxxxxxx`
-
-#### 1. 登录镜像仓库
-
-如果仓库镜像是私有的，需要先登录 GHCR：
-
-```bash
-echo <YOUR_GITHUB_TOKEN> | docker login ghcr.io -u <YOUR_GITHUB_USERNAME> --password-stdin
-```
-
-如果镜像仓库是公开的，这一步可以跳过。
-
-#### 2. 拉取镜像
-
-```bash
-docker pull ghcr.io/<GitHub用户名或组织>/graph-rag-app:latest
-```
-
-如果你希望固定版本，建议把 `latest` 改成具体 tag。
-
-#### 3. 准备运行时配置
-
-运行镜像前，请先准备以下内容：
-
-- `.env`：用于注入 LLM、Embedding、Neo4j、PostgreSQL 等环境变量
-- `runtime/admin/snapshots/`：如果希望容器首次启动时自动恢复图数据，需要把图快照文件一并挂载进去
-- `cache/`、`files/`、`runtime/`：建议挂载到宿主机，避免容器重建后丢失运行产物
-
-其中：
-
-- 应用会在启动时读取 `.env`
-- 当 Neo4j 是空库且 `GRAPH_RESTORE_ON_START=true` 时，会自动尝试从 `runtime/admin/snapshots/` 下最新快照恢复图数据
-
-#### 4. 运行单个应用容器
-
-如果 Neo4j、PostgreSQL、MCP 工具服务都已经在其他位置运行，可以直接启动主镜像：
-
-```bash
-docker run -d \
-  --name graph-rag-app \
-  --env-file .env \
-  -p 8000:8000 \
-  -p 8501:8501 \
-  -p 8502:8502 \
-  -v $(pwd)/cache:/app/cache \
-  -v $(pwd)/files:/app/files \
-  -v $(pwd)/runtime:/app/runtime \
-  ghcr.io/<GitHub用户名或组织>/graph-rag-app:latest
-```
-
-启动后访问：
-
-- 聊天前端：`http://localhost:8501`
-- 管理后台：`http://localhost:8502`
-- 后端 OpenAPI：`http://localhost:8000/docs`
-
-#### 5. 更推荐的方式：与 compose 一起运行
-
-如果你希望把 `postgres`、`neo4j`、`fluid-property-service` 与主应用一起编排，建议保留当前仓库内的 `docker-compose.yaml`，仅把 `app` 镜像来源改成仓库镜像，而不是本地 `build`。
-
-你可以参考这种写法：
-
-```yaml
-services:
-  app:
-    image: ghcr.io/<GitHub用户名或组织>/graph-rag-app:latest
-    env_file:
-      - .env
-    ports:
-      - "8000:8000"
-      - "8501:8501"
-      - "8502:8502"
-    volumes:
-      - ./cache:/app/cache
-      - ./files:/app/files
-      - ./runtime:/app/runtime
-      - ./datasets:/app/datasets
-      - ./documents:/app/documents
-```
-
-然后执行：
-
-```bash
-docker compose up -d
-```
-
-这样做比单独 `docker run` 更稳定，因为依赖服务、网络、健康检查和恢复流程都能统一管理。
 
 ### 7. 启动后端与前端
 
