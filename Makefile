@@ -3,8 +3,10 @@ NEO4J_USER ?= neo4j
 NEO4J_PASSWORD ?= 12345678
 FORCE ?= 0
 ADMIN_BACKEND_PORT ?= 8001
+DOCKER_COMPOSE_FILE ?= docker-compose.image.yaml
+DOCKER_COMPOSE ?= docker compose -f $(DOCKER_COMPOSE_FILE)
 
-.PHONY: clean-neo4j clean-cache reset-graph verify-neo4j rebuild-graph start-backend start-frontend start-admin-frontend start-admin-backend help-admin
+.PHONY: clean-neo4j clean-cache reset-graph verify-neo4j rebuild-graph start-backend start-frontend start-admin-frontend start-admin-backend help-admin docker-pull docker-run docker-stop docker-status
 
 clean-cache:
 	@echo "清空本地缓存目录..."
@@ -62,3 +64,20 @@ help-admin:
 	@echo "3. 启动后端: make start-admin-backend"
 	@echo "4. 启动前端: make start-admin-frontend"
 	@echo "5. 当前默认后台端口: $(ADMIN_BACKEND_PORT)"
+
+docker-pull:
+	@echo "拉取 Docker 镜像，Compose 文件: $(DOCKER_COMPOSE_FILE)"
+	@$(DOCKER_COMPOSE) pull
+
+docker-run: docker-pull
+	@echo "启动 Docker 服务，Compose 文件: $(DOCKER_COMPOSE_FILE)"
+	@$(DOCKER_COMPOSE) up -d
+	@$(MAKE) docker-status
+
+docker-stop:
+	@echo "停止并卸载 Docker 服务，保留命名卷中的数据库和图谱数据。"
+	@$(DOCKER_COMPOSE) down --remove-orphans
+
+docker-status:
+	@echo "当前 Docker 服务状态，Compose 文件: $(DOCKER_COMPOSE_FILE)"
+	@$(DOCKER_COMPOSE) ps
