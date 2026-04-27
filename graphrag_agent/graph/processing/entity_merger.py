@@ -52,12 +52,18 @@ class EntityMerger:
         self.parse_time = 0
     
     def _create_indexes(self) -> None:
-        """创建必要的索引以优化查询性能"""
-        index_queries = [
-            "CREATE INDEX IF NOT EXISTS FOR (e:`__Entity__`) ON (e.id)"
-        ]
-        
-        connection_manager.create_multiple_indexes(index_queries)
+        """创建实体 ID 约束，避免与图文档写入流程冲突。"""
+        # LangChain add_graph_documents(baseEntityLabel=True) 会创建
+        # __Entity__(id) 唯一约束。旧版普通索引会阻塞该约束创建，
+        # 导致实体和关系抽取成功但无法写入 Neo4j。
+        try:
+            connection_manager.drop_index("entity_id")
+            connection_manager.create_index(
+                "CREATE CONSTRAINT entity_id_unique IF NOT EXISTS "
+                "FOR (e:`__Entity__`) REQUIRE e.id IS UNIQUE"
+            )
+        except Exception as exc:
+            print(f"创建实体唯一约束时出错: {exc}")
 
     def _setup_llm_chain(self) -> None:
         """
