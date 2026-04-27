@@ -205,16 +205,72 @@ class GraphAgent(BaseAgent):
             "high_level_keywords": [],
         }
 
+    def _extract_qa_from_messages(self, messages):
+        """从消息列表中反向定位用户提问与检索结果。
+
+        背景:
+            LangGraph 的 ``ToolNode`` 会把同一 ``AIMessage`` 的多个 tool_call
+            合并成单个 ``ToolMessage``，因此非流式路径下 ``messages`` 总是
+            ``[HumanMessage, AIMessage, ToolMessage]``，用 ``messages[-3]``
+            即可拿到提问。但流式路径的 ``_run_retrieval_step`` 会为每个
+            tool_call 生成独立的 ``ToolMessage``，此时硬编码的 ``[-3]`` 会
+            错位到 ``AIMessage``，导致 ``question`` 变成空串。
+
+        返回:
+            (question, docs): question 为原始用户问题字符串；docs 为
+            合并后的检索结果字符串（多个 ToolMessage 按换行拼接）。
+        """
+        # 反向查找最近一条 HumanMessage，避免在多轮对话中拿到过时的提问。
+        question = ""
+        for message in reversed(messages):
+            if isinstance(message, HumanMessage):
+                question = str(message.content or "")
+                break
+
+        # 取最近一段连续的 ToolMessage，拼接它们的 content。
+        docs_parts: List[str] = []
+        for message in reversed(messages):
+            message_type = getattr(message, "type", "")
+            if message_type == "tool" or message.__class__.__name__ == "ToolMessage":
+                content = message.content
+                if isinstance(content, (list, dict)):
+                    try:
+                        content = json.dumps(content, ensure_ascii=False)
+                    except (TypeError, ValueError):
+                        content = str(content)
+                docs_parts.append(str(content or ""))
+            elif docs_parts:
+                # 一旦遇到非 ToolMessage 就停止，避免把更早的检索结果算进来。
+                break
+        docs = "\n".join(reversed(docs_parts))
+
+        return question, docs
+
+    def _get_human_message(self, messages):
+        """返回消息列表中最近一条 HumanMessage；若不存在则返回 None。"""
+        for message in reversed(messages):
+            if isinstance(message, HumanMessage):
+                return message
+        return None
+
     def _grade_documents(self, state) -> str:
         """评估文档相关性，返回 generate 或 reduce。"""
         messages = state["messages"]
-        retrieve_message = messages[-2]
+
+        # 反向定位最近一条 AIMessage（即触发工具调用的那条），避免在
+        # 流式路径下因为存在多个 ToolMessage 而拿到错误索引。
+        retrieve_message = None
+        for message in reversed(messages):
+            if isinstance(message, AIMessage):
+                retrieve_message = message
+                break
 
         tool_calls = []
-        if hasattr(retrieve_message, "tool_calls") and retrieve_message.tool_calls:
-            tool_calls = retrieve_message.tool_calls
-        elif getattr(retrieve_message, "additional_kwargs", None):
-            tool_calls = retrieve_message.additional_kwargs.get("tool_calls", [])
+        if retrieve_message is not None:
+            if hasattr(retrieve_message, "tool_calls") and retrieve_message.tool_calls:
+                tool_calls = retrieve_message.tool_calls
+            elif getattr(retrieve_message, "additional_kwargs", None):
+                tool_calls = retrieve_message.additional_kwargs.get("tool_calls", [])
 
         if tool_calls:
             first_call = tool_calls[0]
@@ -226,26 +282,26 @@ class GraphAgent(BaseAgent):
                 self._log_execution("grade_documents", messages, "reduce")
                 return "reduce"
 
-        try:
-            question = messages[-3].content
-            docs = messages[-1].content
-        except Exception as e:
-            print(f"文档评分出错: {e}")
-            return "generate"
+        question, docs = self._extract_qa_from_messages(messages)
 
         if not docs or len(docs) < 100:
             print("文档内容不足，尝试使用本地搜索")
             try:
+                if not question:
+                    raise ValueError("question 为空，跳过本地搜索")
                 local_result = self.local_tool.search(question)
                 if local_result and len(local_result) > 100:
+                    # 把本地搜索的结果回填到最后一条 ToolMessage，
+                    # 让后续生成节点能直接读到补充后的 docs。
                     messages[-1].content = local_result
                     docs = local_result
             except Exception as e:
                 print(f"本地搜索失败: {e}")
 
         keywords: List[str] = []
-        if hasattr(messages[-3], "additional_kwargs") and messages[-3].additional_kwargs:
-            kw_data = messages[-3].additional_kwargs.get("keywords", {})
+        human_message = self._get_human_message(messages)
+        if human_message is not None and getattr(human_message, "additional_kwargs", None):
+            kw_data = human_message.additional_kwargs.get("keywords", {})
             if isinstance(kw_data, dict):
                 keywords = (
                     self._normalize_keywords(kw_data.get("low_level", []))
@@ -275,8 +331,7 @@ class GraphAgent(BaseAgent):
     def _generate_node(self, state):
         """生成回答节点逻辑。"""
         messages = state["messages"]
-        question = messages[-3].content
-        docs = messages[-1].content
+        question, docs = self._extract_qa_from_messages(messages)
 
         global_result = self.global_cache_manager.get(question)
         if self._should_cache_response(global_result):
@@ -359,8 +414,7 @@ class GraphAgent(BaseAgent):
     def _reduce_node(self, state):
         """处理全局搜索的 reduce 节点逻辑。"""
         messages = state["messages"]
-        question = messages[-3].content
-        docs = messages[-1].content
+        question, docs = self._extract_qa_from_messages(messages)
 
         cache_key = f"reduce:{question}"
         cached_result = self.cache_manager.get(cache_key)
@@ -405,8 +459,11 @@ class GraphAgent(BaseAgent):
         messages = state["messages"]
 
         try:
-            question = messages[-3].content if len(messages) >= 3 else "未找到问题"
-            docs = messages[-1].content if messages[-1] else "未找到相关信息"
+            question, docs = self._extract_qa_from_messages(messages)
+            if not question:
+                question = "未找到问题"
+            if not docs:
+                docs = "未找到相关信息"
         except Exception as e:
             yield f"获取问题或文档时出错: {str(e)}"
             return
@@ -452,8 +509,7 @@ class GraphAgent(BaseAgent):
     async def _reduce_node_stream(self, state: Dict[str, Any]) -> AsyncGenerator[str, None]:
         """基于流式模型归纳全局搜索结果。"""
         messages = state["messages"]
-        question = messages[-3].content
-        docs = messages[-1].content
+        question, docs = self._extract_qa_from_messages(messages)
 
         cache_key = f"reduce:{question}"
         cached_result = self.cache_manager.get(cache_key)

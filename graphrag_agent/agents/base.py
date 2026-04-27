@@ -413,9 +413,21 @@ class BaseAgent(ABC):
                 raise ValueError(f"未注册的工具: {tool_name}")
 
             tool_result = await self._invoke_tool_async(tool, tool_args)
+            # ToolMessage.content 必须是字符串：下游 grade/generate 节点会
+            # 直接对其调用 .lower() 等字符串方法，若工具返回 list/dict 会抛
+            # AttributeError。LangGraph 自带的 ToolNode 也是这样序列化的。
+            if isinstance(tool_result, (list, dict)):
+                try:
+                    tool_content = json.dumps(tool_result, ensure_ascii=False)
+                except (TypeError, ValueError):
+                    tool_content = str(tool_result)
+            elif tool_result is None:
+                tool_content = ""
+            else:
+                tool_content = str(tool_result)
             tool_messages.append(
                 ToolMessage(
-                    content=tool_result,
+                    content=tool_content,
                     tool_call_id=tool_call_id,
                     name=tool_name,
                 )
