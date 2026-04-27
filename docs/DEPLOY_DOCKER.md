@@ -1,75 +1,57 @@
-# GraphRAG 一键 Docker 部署指南
+# GraphRAG Docker 快速部署指南
 
-> 适用场景：在一台只装了 Docker 的机器上，**仅通过一个 `.env` 文件** 就拉起整个 GraphRAG 项目（App + Neo4j + Postgres + 流体属性微服务）。底层与仓库 `make docker-run` 完全一致，使用官方发布镜像 `docker-compose.image.yaml`，无需本地构建。
-
----
-
-## 1. 核心思路
-
-`make docker-run` 实际执行的是：
-
-```bash
-docker compose -f docker-compose.image.yaml pull
-docker compose -f docker-compose.image.yaml up -d
-```
-
-所以只要部署机上：
-
-1. 有 `.env` 文件（填好 LLM Key）
-2. 有仓库里的 `docker-compose.image.yaml`
-3. 装了 `docker` + `docker compose`
-
-就可以一条命令拉起全栈。本文档就是把这个过程包装成「最小可复现步骤」，不依赖 Python / make / 源码仓库本体。
+> 适用场景：在一台已安装 Docker 的机器上，仅通过一个 `.env` 文件 + 一个 `docker-compose.yaml`（或直接用 `docker run`）即可拉起完整的 GraphRAG 服务栈（FastAPI + Chat UI + Admin UI + Neo4j + Postgres + 流体属性微服务）。
 
 ---
 
-## 2. 前置要求
+## 1. 前置要求
 
 | 项目 | 要求 |
 |------|------|
 | 操作系统 | Linux / macOS / Windows (WSL2) |
 | Docker Engine | ≥ 24.0 |
-| Docker Compose | v2（自带 `docker compose` 子命令） |
-| 内存 | ≥ 8 GB（Neo4j 堆 4G + App 推理 ~2G） |
-| 磁盘 | ≥ 10 GB |
-| 网络 | 首次需拉取镜像 & 调用 LLM API |
+| Docker Compose | v2（`docker compose` 子命令） |
+| 可用内存 | ≥ 8 GB（Neo4j 堆 + App 推理） |
+| 可用磁盘 | ≥ 10 GB（镜像 + 图数据卷） |
+| 可访问外网 | 首次需要拉取镜像及调用 LLM API |
 
-放行端口（宿主机）：`8000`（API）、`8501`（Chat UI）、`8502`（Admin UI）、`7474/7687`（Neo4j）、`5432`（Postgres）。
+开放端口（宿主机 → 容器）：
+
+- `8000` FastAPI 后端 API
+- `8501` Chat 前端（Streamlit）
+- `8502` Admin 控制台（Streamlit）
+- `7474` Neo4j Browser
+- `7687` Neo4j Bolt
+- `5432` Postgres（admin 元数据）
 
 ---
 
-## 3. 部署目录结构
+## 2. 部署目录结构
 
-选一个空目录（以下记作 `~/graphrag-deploy`），最终只需两个文件：
+在任意空目录（以下示例为 `~/graphrag-deploy`）下准备如下两个文件即可：
 
 ```
 graphrag-deploy/
-├── .env                       # 配置（见第 4 节）
-└── docker-compose.image.yaml  # 编排（见第 5 节，直接复制）
+├── .env                  # 配置（必填，参考第 3 节）
+└── docker-compose.yaml   # 编排（直接使用第 4 节模板）
 ```
 
-启动后 Docker 会自动在该目录旁生成持久化挂载目录：
+首次启动后，Docker 会自动在该目录旁创建如下挂载目录（用于持久化）：
 
 ```
+graphrag-deploy/
 ├── cache/        # 嵌入/结果缓存
 ├── files/        # 用户上传文件
 ├── runtime/      # 构建日志、图快照
-├── datasets/     # 数据集（可选）
-└── documents/    # 文档语料（可选）
+├── datasets/     # 原始数据集（只读）
+├── documents/    # 文档语料（只读）
 ```
-
-> ⚠️ **强烈建议启动前先手动创建这些目录**（否则容器会报 `PermissionError: cache/huggingface`，见 FAQ Q5）：
-> ```bash
-> cd ~/graphrag-deploy
-> mkdir -p cache files runtime datasets documents
-> ```
-> 原因：容器内应用以 `appuser` (UID=1000) 运行，若目录不存在，Docker 守护进程会以 root 身份自动创建，导致 `appuser` 无写权限，后端 FastAPI 启动时直接崩溃。手动创建则属主为当前宿主机用户（通常也是 UID=1000），权限一致。
 
 ---
 
-## 4. 准备 `.env`
+## 3. 准备 `.env` 文件
 
-最小可运行配置（复制保存为 `.env`，替换 Key 即可）：
+在部署目录创建 `.env`，最小可运行配置如下（仅需替换 **Chat / Embedding 的 Key 与 Base URL**）：
 
 ```dotenv
 # === Chat 模型（必填）===
@@ -82,22 +64,36 @@ EMBEDDING_API_KEY=sk-your-embedding-key
 EMBEDDING_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 EMBEDDING_MODEL=text-embedding-v3
 
-# === OpenAI 兼容兜底（可选）===
+# === OpenAI 兼容兜底（可选，Chat/Embedding 未配时回退）===
 OPENAI_API_KEY=sk-your-fallback-key
 OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 OPENAI_LLM_MODEL=qwen3-max
 
-...
+# === 服务并发 ===
+SERVER_WORKERS=1
+FASTAPI_WORKERS=2
+TEMPERATURE=0
+MAX_TOKENS=2000
+
+# === Admin / 前端 ===
+GRAPH_ADMIN_ENABLED=true
+FRONTEND_DEFAULT_AGENT=naive_rag_agent
+FRONTEND_USE_STREAM=true
+
+# === Neo4j（保持与 compose 中服务一致即可）===
+NEO4J_USERNAME=neo4j
+NEO4J_PASSWORD=12345678
 ```
 
-> 💡 更多可调参数（GDS、检索、多智能体、缓存等）可直接从仓库 `.env.example` 拷贝后按需修改。
-> ⚠️ **不要在 `.env` 里写 `NEO4J_URI` 或 `GRAPH_ADMIN_METADATA_DSN`**——compose 会用容器内服务名强制覆盖，写了反而冲突。
+> 💡 其余参数（GDS、缓存、检索、多智能体等）如需调优，可从仓库内 `.env.example` 完整拷贝后按需修改。容器启动时会通过 `env_file: .env` 直接加载。
+
+> ⚠️ `NEO4J_URI` 与 `GRAPH_ADMIN_METADATA_DSN` **无需在 `.env` 里写**，compose 会强制覆盖为容器内部服务名（`neo4j://neo4j:7687` / `postgresql://postgres:postgres@postgres:5432/graphrag_admin`），避免 `localhost` 语义冲突。
 
 ---
 
-## 5. 获取 `docker-compose.image.yaml`
+## 4. `docker-compose.yaml` 模板
 
-将下述内容保存为部署目录下的 `docker-compose.image.yaml`（内容与仓库根目录同名文件一致）：
+将下述内容保存为部署目录下的 `docker-compose.yaml`（直接复用仓库发布镜像，无需本地构建）：
 
 ```yaml
 services:
@@ -106,160 +102,241 @@ services:
     container_name: graph-rag-app
     env_file:
       - .env
-    ...
+    environment:
+      # 容器网络内统一走服务名，避免使用宿主机 localhost
+      NEO4J_URI: neo4j://neo4j:7687
+      GRAPH_ADMIN_METADATA_DSN: postgresql://postgres:postgres@postgres:5432/graphrag_admin
+      FRONTEND_API_URL: http://127.0.0.1:8000
+      ADMIN_FRONTEND_API_URL: http://127.0.0.1:8000
+      MCP_TOOL_ENDPOINTS: http://fluid-property-service:8010
+      FLUID_PROPERTY_SERVICE_URL: http://fluid-property-service:8010
+      SERVER_HOST: 0.0.0.0
+      SERVER_PORT: 8000
+      SERVER_WORKERS: ${SERVER_WORKERS:-1}
+      FASTAPI_WORKERS: ${FASTAPI_WORKERS:-2}
+    ports:
+      - "8000:8000"   # FastAPI
+      - "8501:8501"   # Chat UI
+      - "8502:8502"   # Admin UI
+    volumes:
+      - ./cache:/app/cache
+      - ./files:/app/files
+      - ./runtime:/app/runtime
+      - ./datasets:/app/datasets
+      - ./documents:/app/documents
+    depends_on:
+      postgres:
+        condition: service_healthy
+      neo4j:
+        condition: service_started
+      fluid-property-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "/app/docker/app/healthcheck.py"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+
+  fluid-property-service:
+    image: ${GRAPH_RAG_IMAGE:-ghcr.io/omnistormx/graph-rag-app:graphRAG-CSU}
+    container_name: graph-rag-fluid-property-service
+    env_file:
+      - .env
+    environment:
+      PYTHONPATH: /app:/app/server:/app/frontend
+    command:
+      - python
+      - -m
+      - uvicorn
+      - tool_services.fluid_property_service.app:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8010"
+    expose:
+      - "8010"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8010/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16
+    container_name: graph-rag-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: graphrag_admin
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      TZ: UTC
+      PGTZ: UTC
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d graphrag_admin"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  neo4j:
+    image: neo4j:5.22.0
+    container_name: graph-rag-neo4j
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      NEO4J_AUTH: "neo4j/12345678"
+      NEO4J_PLUGINS: '["apoc", "graph-data-science"]'
+      NEO4J_dbms_security_procedures_unrestricted: "apoc.*,gds.*"
+      NEO4J_dbms_memory_heap_initial__size: "2G"
+      NEO4J_dbms_memory_heap_max__size: "2G"
+      NEO4J_dbms_memory_pagecache_size: "1G"
+      NEO4J_apoc_trigger_enabled: "true"
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+      - neo4j_plugins:/plugins
+    restart: unless-stopped
+
+volumes:
+  neo4j_data:
+  neo4j_logs:
+  neo4j_plugins:
+  postgres_data:
 ```
 
-> 如果要从私有镜像仓库拉取，在 `.env` 增加一行：
+> 如果需要替换为私有镜像仓库，仅需在 `.env` 中加一行：
 > `GRAPH_RAG_IMAGE=your-registry.example.com/graph-rag-app:v1.0.0`
 
 ---
 
-## 6. 一键启动（等价于 `make docker-run`）
+## 5. 启动与停止
 
-在部署目录执行：
+在部署目录（包含 `.env` 和 `docker-compose.yaml`）执行：
 
 ```bash
-# 拉镜像
-docker compose -f docker-compose.image.yaml pull
+# 启动（首次会自动拉取镜像，需要几分钟）
+docker compose up -d
 
-# 一键拉起全栈（后台运行）
-docker compose -f docker-compose.image.yaml up -d
+# 查看服务状态
+docker compose ps
 
-# 查看状态
-docker compose -f docker-compose.image.yaml ps
+# 查看应用日志（Ctrl+C 退出，但不停止服务）
+docker compose logs -f app
+
+# 停止并保留数据卷
+docker compose down
+
+# 停止并清除所有数据（⚠️ 会清空 Neo4j / Postgres 的持久化数据）
+docker compose down -v
 ```
 
-> 💡 如果嫌 `-f docker-compose.image.yaml` 太长，把文件重命名为默认的 `docker-compose.yaml` 即可省略 `-f` 参数：
-> ```bash
-> mv docker-compose.image.yaml docker-compose.yaml
-> docker compose up -d
-> ```
-
-启动就绪判断（app 容器变为 `healthy` 即可）：
+启动就绪判断：
 
 ```bash
-docker compose -f docker-compose.image.yaml ps app
-# STATUS 列出现 (healthy) 表示全部就绪
+# 等待 app 容器变为 healthy
+docker compose ps app
+# STATUS 列出现 (healthy) 即可
 ```
 
 ---
 
-## 7. 访问入口
+## 6. 访问入口
 
+运行"一键拉起全栈"命令后，**等待一段时间**后 web 服务会被拉取，访问以下网址：
 | 服务 | 地址 | 用途 |
 |------|------|------|
 | Chat 前端 | http://localhost:8501 | 用户问答主界面 |
-| Admin 控制台 | http://localhost:8502 | 数据集管理 / 图构建 / 快照 |
+| Admin 控制台 | http://localhost:8502 | 数据集管理、图构建、快照 |
 | FastAPI Swagger | http://localhost:8000/docs | 后端 API 调试 |
-| Neo4j Browser | http://localhost:7474 | 图数据库浏览（登录：`neo4j` / `12345678`） |
+| Neo4j Browser | http://localhost:7474 | 图数据库浏览（登录：neo4j / 12345678） |
 
 ---
 
-## 8. 常用运维命令
+## 7. 单容器快速验证（无 compose）
 
-```bash
-COMPOSE="docker compose -f docker-compose.image.yaml"
+如果只想快速验证 App 镜像是否可用（依赖需自备或指向外部 Neo4j/Postgres），可在含 `.env` 的目录执行：
 
-# 查看应用日志
-$COMPOSE logs -f app
-
-# 停止服务（保留数据卷）
-$COMPOSE down
-
-# 停止并清除所有数据（⚠️ 会清空 Neo4j / Postgres 持久化）
-$COMPOSE down -v
-
-# 只重启 app（改完 .env 后）
-$COMPOSE up -d --force-recreate app fluid-property-service
-
-# 升级 app 镜像，保留数据
-$COMPOSE pull app && $COMPOSE up -d app
-
-# 进入 app 容器
-$COMPOSE exec app bash
-
-# 在容器里重建图索引
-$COMPOSE exec app python -m graphrag_agent.integrations.build.main --help
-```
-
----
-
-## 9. FAQ
-
-**Q1. app 一直 `unhealthy`？**
-```bash
-docker compose -f docker-compose.image.yaml logs --tail=200 app
-```
-常见原因：LLM Key 错误、端口被占、Neo4j 初始化慢（等 60s 内的 `start_period`）。
-
-**Q2. 改了 `.env` 没生效？**
-`env_file` 只在容器启动时读取，需 `--force-recreate`：
-```bash
-docker compose -f docker-compose.image.yaml up -d --force-recreate app fluid-property-service
-```
-
-**Q3. 想换 Neo4j 密码？**
-同时改 compose 中 `NEO4J_AUTH: "neo4j/<新>"` 和 `.env` 中 `NEO4J_PASSWORD=<新>`，然后 `down -v` 重启（会清库）。
-
-**Q4. 能不能真的只跑一个容器？**
-App 镜像里不包含 Neo4j/Postgres。若要「真·单容器」，需要用外部已有的 Neo4j + Postgres：
 ```bash
 docker run -d --name graph-rag-app \
   --env-file .env \
-  -e NEO4J_URI=neo4j://<your-neo4j-host>:7687 \
-  -e GRAPH_ADMIN_METADATA_DSN=postgresql://postgres:postgres@<your-pg-host>:5432/graphrag_admin \
+  -e NEO4J_URI=neo4j://host.docker.internal:7687 \
+  -e GRAPH_ADMIN_METADATA_DSN=postgresql://postgres:postgres@host.docker.internal:5432/graphrag_admin \
   -p 8000:8000 -p 8501:8501 -p 8502:8502 \
   -v "$(pwd)/cache:/app/cache" \
   -v "$(pwd)/files:/app/files" \
   -v "$(pwd)/runtime:/app/runtime" \
   ghcr.io/omnistormx/graph-rag-app:graphRAG-CSU
 ```
-生产场景仍强烈建议用 compose 整栈，保证依赖隔离与版本一致。
+
+> 适用于「已有外部 Neo4j + Postgres」的场景，生产仍建议使用 compose 编排整栈。
 
 ---
 
-**Q5. Streamlit 前端能打开，但 Admin 后台报 `Connection refused: 127.0.0.1:8000/admin/health`？**
+## 8. 常见问题（FAQ）
 
-**前台页面起来 ≠ 后端存活**。Streamlit UI (8501/8502) 和 FastAPI 后端 (8000) 是独立进程，后端崩了前台还能开，但所有需要调后端的功能都会报 `Connection refused`。
-
-**最常见根因：宿主机挂载目录权限问题**（Docker bind mount 经典陷阱）。
-
-**排查三步**：
+**Q1. 容器启动后 `app` 一直 `unhealthy`？**
+查看日志定位阶段：
 ```bash
-# 1. 看后端是否真的崩了
-docker compose -f docker-compose.image.yaml logs --tail=100 app | grep -E "Error|Permission"
+docker compose logs --tail=200 app
+```
+常见原因：
+- LLM API Key / Base URL 配置错误（检查 `.env` 中 `CHAT_*` / `EMBEDDING_*`）
+- Neo4j 尚未就绪，等 60s 后 `start_period` 结束会重试
+- 端口 8000/8501/8502 被宿主机占用
 
-# 2. 对比容器里的用户 UID 和宿主机目录属主
-docker exec graph-rag-app id                    # 通常是 uid=1000(appuser)
-ls -ld ./cache ./files ./runtime                 # 如果显示 root root 就是问题所在
-
-# 3. 健康检查细节
-docker inspect graph-rag-app --format '{{json .State.Health}}' | python3 -m json.tool
+**Q2. 如何重新构建图索引？**
+进入 app 容器执行构建 CLI：
+```bash
+docker compose exec app \
+  python -m graphrag_agent.integrations.build.main --help
 ```
 
-如果日志里出现 `PermissionError: [Errno 13] Permission denied: 'cache/...'`，用下面两选一修复：
-
-**方案 A（推荐，一次性修）**：修正目录属主为 UID=1000（容器里的 `appuser`）
+**Q3. 如何只升级镜像保留数据？**
 ```bash
-sudo chown -R 1000:1000 ./cache ./files ./runtime ./datasets ./documents
-docker compose -f docker-compose.image.yaml restart app
+docker compose pull app
+docker compose up -d app
+```
+`cache/`、`files/`、`runtime/` 及 `neo4j_data` / `postgres_data` 卷会保留。
+
+**Q4. 修改 `.env` 后是否需要重启？**
+需要。`env_file` 只在容器启动时读取：
+```bash
+docker compose up -d --force-recreate app fluid-property-service
 ```
 
-**方案 B（一劳永逸）**：部署前先手动建目录（见第 3 节的前置提示），让目录从一开始就归当前用户所有，不需要 sudo。
+**Q5. Neo4j 密码想换怎么办？**
+同时修改以下两处并 `docker compose down -v`（会清库）后重启：
+- compose 中 `NEO4J_AUTH: "neo4j/<新密码>"`
+- `.env` 中 `NEO4J_PASSWORD=<新密码>`
 
-> 为什么会发生？如果这些目录在 `docker compose up` 时不存在，Docker daemon 会以 **root 身份** 自动创建它们；而容器内的 `appuser` (UID=1000) 对 root 所有的目录只有只读权限，于是 `HF_HOME.mkdir()` 之类的写操作直接抛 `PermissionError`，Python 进程退出，FastAPI 端口再也不会 listen。
+---
+
+## 9. 生产加固建议（可选）
+
+1. **密钥管理**：`.env` 严禁入库；在 CI/CD 或 Secret Manager 中注入。
+2. **反向代理**：前置 Nginx / Caddy，统一 HTTPS、限流与鉴权；不要把 8501 / 8502 / 7474 直接暴露到公网。
+3. **资源限制**：在每个 service 下加 `deploy.resources.limits`（memory / cpus），防止 Neo4j GDS 计算挤占。
+4. **备份策略**：定期 `neo4j-admin database dump` 并同步 `postgres_data` 卷；`runtime/admin/snapshots` 也纳入备份。
+5. **监控**：接入 Langfuse（见 `.env` 中 `LANGFUSE_*`）跟踪 LLM 调用与成本；Prometheus 抓 `/metrics`（如后续启用）。
+6. **镜像版本固化**：避免使用 `:latest`，在 `.env` 固定 `GRAPH_RAG_IMAGE=...:<commit-sha>`。
 
 ---
 
 ## 10. 快速核对清单
 
-- [ ] 目录下有 `.env` 和 `docker-compose.image.yaml`
-- [ ] 已手动 `mkdir -p cache files runtime datasets documents`（避免权限踩坑）
 - [ ] `.env` 中 `CHAT_*` / `EMBEDDING_*` 已填真实 Key
-- [ ] `8000 / 8501 / 8502 / 7474 / 7687 / 5432` 端口未被占用
-- [ ] `docker compose -f docker-compose.image.yaml up -d` 后 `ps` 全部 running/healthy
-- [ ] http://localhost:8501 能正常问答
-- [ ] http://localhost:8502 能打开 Admin
-- [ ] http://localhost:8000/docs 能看到 Swagger
+- [ ] 8000 / 8501 / 8502 / 7474 / 7687 / 5432 端口未被占用
+- [ ] `docker compose up -d` 后 `docker compose ps` 全部 `running/healthy`
+- [ ] 打开 http://localhost:8501 能进行一轮问答
+- [ ] 打开 http://localhost:8502 能看到 Admin 控制台
+- [ ] http://localhost:8000/docs 可访问 Swagger
 
-通过即部署成功。
+全部通过即代表部署成功，可开始导入数据并构建图索引。
