@@ -41,8 +41,12 @@ class HybridAgent(BaseAgent):
             keywords = self.search_tool.extract_keywords(query)
             if not isinstance(keywords, dict):
                 keywords = {}
-            keywords.setdefault("low_level", [])
-            keywords.setdefault("high_level", [])
+            keywords["low_level"] = self._normalize_keywords(
+                keywords.get("low_level", [])
+            )
+            keywords["high_level"] = self._normalize_keywords(
+                keywords.get("high_level", [])
+            )
             self._keyword_cache[query] = keywords
             return keywords
         except Exception as e:
@@ -63,8 +67,16 @@ class HybridAgent(BaseAgent):
         except Exception:
             docs = "无法获取检索结果"
 
+        if self._is_negative_or_empty_response(docs):
+            self._log_execution(
+                "generate",
+                {"question": question, "docs_length": len(docs), "empty_retrieval": True},
+                docs,
+            )
+            return {"messages": [AIMessage(content=docs)]}
+
         global_result = self.global_cache_manager.get(question)
-        if self._is_valid_text_response(global_result):
+        if self._should_cache_response(global_result):
             self._log_execution(
                 "generate",
                 {"question": question, "docs_length": len(docs)},
@@ -74,7 +86,7 @@ class HybridAgent(BaseAgent):
 
         thread_id = state.get("configurable", {}).get("thread_id", "default")
         cached_result = self.cache_manager.get(question, thread_id=thread_id)
-        if self._is_valid_text_response(cached_result):
+        if self._should_cache_response(cached_result):
             self._log_execution(
                 "generate",
                 {"question": question, "docs_length": len(docs)},
@@ -95,7 +107,7 @@ class HybridAgent(BaseAgent):
                 "question": question,
                 "response_type": response_type,
             })
-            if response and len(response) > 10:
+            if response and len(response) > 10 and self._should_cache_response(response):
                 self.cache_manager.set(question, response, thread_id=thread_id)
                 self.global_cache_manager.set(question, response)
 
@@ -128,6 +140,15 @@ class HybridAgent(BaseAgent):
         except Exception:
             docs = "无法获取检索结果"
 
+        if self._is_negative_or_empty_response(docs):
+            yield docs
+            self._log_execution(
+                "generate",
+                {"question": question, "docs_length": len(docs), "empty_retrieval": True},
+                docs,
+            )
+            return
+
         thread_id = state.get("configurable", {}).get("thread_id", "default")
         prompt = ChatPromptTemplate.from_messages([
             ("system", LC_SYSTEM_PROMPT),
@@ -148,14 +169,14 @@ class HybridAgent(BaseAgent):
             yield text
 
         response = "".join(response_chunks).strip()
-        if response:
+        if self._should_cache_response(response):
             self.cache_manager.set(question, response, thread_id=thread_id)
             self.global_cache_manager.set(question, response)
-            self._log_execution(
-                "generate",
-                {"question": question, "docs_length": len(docs)},
-                response,
-            )
+        self._log_execution(
+            "generate",
+            {"question": question, "docs_length": len(docs)},
+            response,
+        )
 
     async def _stream_process(self, inputs, config):
         """复用基类统一的流式工作流。"""

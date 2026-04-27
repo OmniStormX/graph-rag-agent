@@ -83,6 +83,58 @@ class BaseAgent(ABC):
     def _is_valid_text_response(self, value: Any) -> bool:
         """判断对象是否为可直接作为最终回答的文本。"""
         return isinstance(value, str) and bool(value.strip())
+
+    def _is_negative_or_empty_response(self, value: Any) -> bool:
+        """判断回答是否属于无证据兜底结果，避免污染可复用缓存。"""
+        if not isinstance(value, str):
+            return False
+
+        normalized = value.strip()
+        if normalized in {"不知道", "未能生成回答"}:
+            return True
+
+        negative_markers = (
+            "当前未提供任何分析报告",
+            "无法确定具体的分析对象",
+            "无法阐述任何作用机理",
+            "无法识别关键变量",
+            "无法得出任何工程结论",
+            "没有找到相关的低级内容",
+            "没有找到相关的高级内容",
+            "当前知识库没有检索到可支持回答的文档证据",
+            "没有找到与",
+            "未找到相关信息",
+            "在知识库中未找到相关信息",
+            "搜索过程中出错",
+            "查询实体信息时出错",
+            "查询社区信息时出错",
+        )
+        return any(marker in normalized for marker in negative_markers)
+
+    def _should_cache_response(self, value: Any) -> bool:
+        """仅缓存有实质内容的正向回答。"""
+        return self._is_valid_text_response(value) and not self._is_negative_or_empty_response(value)
+
+    def _normalize_keywords(self, value: Any) -> List[str]:
+        """将模型返回的关键词统一整理为字符串列表。"""
+        if value is None:
+            return []
+        if isinstance(value, str):
+            stripped = value.strip()
+            return [stripped] if stripped else []
+        if isinstance(value, dict):
+            normalized: List[str] = []
+            for item in value.values():
+                normalized.extend(self._normalize_keywords(item))
+            return normalized
+        if isinstance(value, (list, tuple, set)):
+            normalized = []
+            for item in value:
+                normalized.extend(self._normalize_keywords(item))
+            return normalized
+
+        stripped = str(value).strip()
+        return [stripped] if stripped else []
     
     @abstractmethod
     def _setup_tools(self) -> List:
@@ -568,15 +620,19 @@ class BaseAgent(ABC):
             "hit": result is not None
         })
         
-        return result if self._is_valid_text_response(result) else None
+        return result if self._should_cache_response(result) else None
 
     def _build_keyword_cache_params(self, query: str, thread_id: str = "default") -> Dict[str, Any]:
         """构建语义缓存所需的关键词参数。"""
         keywords = self._extract_keywords(query)
         return {
             "thread_id": thread_id,
-            "low_level_keywords": keywords.get("low_level", []),
-            "high_level_keywords": keywords.get("high_level", [])
+            "low_level_keywords": self._normalize_keywords(
+                keywords.get("low_level", [])
+            ),
+            "high_level_keywords": self._normalize_keywords(
+                keywords.get("high_level", [])
+            )
         }
 
     def check_semantic_cache(
@@ -611,7 +667,7 @@ class BaseAgent(ABC):
             "hit": result is not None
         })
 
-        return result if self._is_valid_text_response(result) else None
+        return result if self._should_cache_response(result) else None
 
     def _lookup_cached_response(self, query: str, thread_id: str = "default"):
         """统一缓存决策逻辑，返回命中内容、命中类型与总耗时。"""
@@ -619,7 +675,7 @@ class BaseAgent(ABC):
 
         # 1. 全局缓存仅做精确匹配，避免在共享缓存上触发昂贵的语义检索。
         global_result = self.global_cache_manager.get_exact(query)
-        if self._is_valid_text_response(global_result):
+        if self._should_cache_response(global_result):
             cache_time = time.time() - cache_check_start
             self._log_performance("cache_check", {
                 "duration": cache_time,
@@ -629,7 +685,7 @@ class BaseAgent(ABC):
 
         # 2. 会话快速路径只允许精确高质量命中，保证 fast path 可预测。
         fast_result = self.check_fast_cache(query, thread_id)
-        if self._is_valid_text_response(fast_result):
+        if self._should_cache_response(fast_result):
             self.global_cache_manager.set(query, fast_result)
             cache_time = time.time() - cache_check_start
             self._log_performance("cache_check", {
@@ -644,7 +700,7 @@ class BaseAgent(ABC):
             thread_id,
             high_quality_only=True
         )
-        if self._is_valid_text_response(semantic_result):
+        if self._should_cache_response(semantic_result):
             self.global_cache_manager.set(query, semantic_result)
             cache_time = time.time() - cache_check_start
             self._log_performance("cache_check", {
@@ -655,7 +711,7 @@ class BaseAgent(ABC):
 
         # 4. 精确缓存兜底，允许返回未标记高质量但仍可用的会话缓存。
         exact_result = self.cache_manager.get_exact(query, thread_id=thread_id)
-        if self._is_valid_text_response(exact_result):
+        if self._should_cache_response(exact_result):
             self.global_cache_manager.set(query, exact_result)
             cache_time = time.time() - cache_check_start
             self._log_performance("cache_check", {
@@ -670,7 +726,7 @@ class BaseAgent(ABC):
             thread_id,
             high_quality_only=False
         )
-        if self._is_valid_text_response(semantic_fallback):
+        if self._should_cache_response(semantic_fallback):
             self.global_cache_manager.set(query, semantic_fallback)
             cache_time = time.time() - cache_check_start
             self._log_performance("cache_check", {
@@ -689,7 +745,7 @@ class BaseAgent(ABC):
     def _check_all_caches(self, query: str, thread_id: str = "default"):
         """整合的缓存检查方法"""
         cached_result, cache_type, _ = self._lookup_cached_response(query, thread_id)
-        if self._is_valid_text_response(cached_result):
+        if self._should_cache_response(cached_result):
             self._log_runtime_event(
                 "agent.cache_hit",
                 thread_id=thread_id,
@@ -1003,8 +1059,12 @@ class BaseAgent(ABC):
         keywords = self._extract_keywords(query)
         cache_params = {
             "thread_id": thread_id,
-            "low_level_keywords": keywords.get("low_level", []),
-            "high_level_keywords": keywords.get("high_level", [])
+            "low_level_keywords": self._normalize_keywords(
+                keywords.get("low_level", [])
+            ),
+            "high_level_keywords": self._normalize_keywords(
+                keywords.get("high_level", [])
+            )
         }
         
         # 调用缓存管理器的质量标记方法，传递相关参数
@@ -1104,7 +1164,9 @@ class BaseAgent(ABC):
             # 相关性检查 - 检查问题关键词是否在答案中出现
             keywords = self._extract_keywords(query)
             if keywords:
-                low_level_keywords = keywords.get("low_level", [])
+                low_level_keywords = self._normalize_keywords(
+                    keywords.get("low_level", [])
+                )
                 if low_level_keywords:
                     # 至少有一个低级关键词应该在答案中出现
                     keyword_found = any(keyword.lower() in answer.lower() for keyword in low_level_keywords)

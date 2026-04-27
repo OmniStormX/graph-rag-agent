@@ -26,6 +26,12 @@ from graphrag_agent.search.retrieval_adapter import (
 )
 
 
+HYBRID_NO_EVIDENCE_ANSWER = (
+    "当前知识库没有检索到可支持回答的文档证据。"
+    "请确认上传文档已经完成图谱构建、目标图谱版本已激活，并清理当前会话缓存后再提问。"
+)
+
+
 class HybridSearchTool(BaseSearchTool):
     """
     混合搜索工具，实现类似LightRAG的双级检索策略
@@ -557,6 +563,18 @@ class HybridSearchTool(BaseSearchTool):
             
             # 2. 检索高级内容（社区和主题）
             high_level_content, high_evidence = self._retrieve_high_level_content(query, high_keywords)
+
+            all_evidence = merge_retrieval_results(low_evidence, high_evidence)
+            if not all_evidence:
+                # 没有证据时直接返回确定性提示，避免 LLM 把空上下文包装成“分析报告”。
+                return {
+                    "query": query,
+                    "low_level_content": low_level_content,
+                    "high_level_content": high_level_content,
+                    "final_answer": HYBRID_NO_EVIDENCE_ANSWER,
+                    "retrieval_results": [],
+                    "status": "no_evidence",
+                }
             
             # 3. 生成最终答案
             llm_start = time.time()
@@ -571,7 +589,6 @@ class HybridSearchTool(BaseSearchTool):
             
             self.performance_metrics["llm_time"] += time.time() - llm_start
             
-            all_evidence = merge_retrieval_results(low_evidence, high_evidence)
             structured_result = {
                 "query": query,
                 "low_level_content": low_level_content,

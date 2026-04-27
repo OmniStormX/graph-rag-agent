@@ -140,7 +140,7 @@ class DeepResearchAgent(BaseAgent):
 
         # 首先尝试全局缓存
         global_result = self.global_cache_manager.get(question)
-        if self._is_valid_text_response(global_result):
+        if self._should_cache_response(global_result):
             self._log_execution("generate", 
                             {"question": question, "source": "全局缓存"}, 
                             "全局缓存命中")
@@ -151,7 +151,7 @@ class DeepResearchAgent(BaseAgent):
             
         # 然后检查会话缓存
         cached_result = self.cache_manager.get(question, thread_id=thread_id)
-        if self._is_valid_text_response(cached_result):
+        if self._should_cache_response(cached_result):
             self._log_execution("generate", 
                             {"question": question, "source": "会话缓存"}, 
                             "会话缓存命中")
@@ -169,13 +169,13 @@ class DeepResearchAgent(BaseAgent):
                     # 包含思考过程，提取干净的答案
                     clean_answer = re.sub(r'<think>.*?</think>\s*', '', answer, flags=re.DOTALL)
                     # 缓存清理后的答案
-                    if clean_answer and len(clean_answer) > 10:
+                    if clean_answer and len(clean_answer) > 10 and self._should_cache_response(clean_answer):
                         self.cache_manager.set(question, clean_answer, thread_id=thread_id)
                         self.global_cache_manager.set(question, clean_answer)
                     return {"messages": [AIMessage(content=clean_answer)]}
                 else:
                     # 没有特殊标记，直接使用
-                    if answer and len(answer) > 10:
+                    if answer and len(answer) > 10 and self._should_cache_response(answer):
                         self.cache_manager.set(question, answer, thread_id=thread_id)
                         self.global_cache_manager.set(question, answer)
                     return {"messages": [AIMessage(content=answer)]}
@@ -185,7 +185,10 @@ class DeepResearchAgent(BaseAgent):
         # 如果检索结果不是包含思考过程的字符串，直接返回
         if not isinstance(retrieval_result, str) or not retrieval_result.startswith("<think>"):
             # 直接返回检索结果
-            if self.cache_manager.validate_answer(question, retrieval_result):
+            if (
+                self.cache_manager.validate_answer(question, retrieval_result)
+                and self._should_cache_response(retrieval_result)
+            ):
                 # 更新会话缓存
                 self.cache_manager.set(question, retrieval_result, thread_id=thread_id)
                 # 更新全局缓存
@@ -214,7 +217,10 @@ class DeepResearchAgent(BaseAgent):
             })
             
             # 缓存结果 - 同时更新会话缓存和全局缓存
-            if self.cache_manager.validate_answer(question, response):
+            if (
+                self.cache_manager.validate_answer(question, response)
+                and self._should_cache_response(response)
+            ):
                 # 更新会话缓存
                 self.cache_manager.set(question, response, thread_id=thread_id)
                 # 更新全局缓存
@@ -345,13 +351,13 @@ class DeepResearchAgent(BaseAgent):
                             clean_answer = re.sub(r'<think>.*?</think>\s*', '', final_answer, flags=re.DOTALL)
                             
                             # 缓存清理后的答案
-                            if clean_answer and len(clean_answer) > 10:
+                            if clean_answer and len(clean_answer) > 10 and self._should_cache_response(clean_answer):
                                 self.cache_manager.set(f"deep:{query}", clean_answer, thread_id=thread_id)
                             
                             yield clean_answer
                         else:
                             # 没有思考标记，直接使用
-                            if final_answer and len(final_answer) > 10:
+                            if final_answer and len(final_answer) > 10 and self._should_cache_response(final_answer):
                                 self.cache_manager.set(f"deep:{query}", final_answer, thread_id=thread_id)
                             
                             yield final_answer
@@ -367,12 +373,12 @@ class DeepResearchAgent(BaseAgent):
                         if "<think>" in final_answer and "</think>" in final_answer:
                             clean_answer = re.sub(r'<think>.*?</think>\s*', '', final_answer, flags=re.DOTALL)
                             # 缓存清理后的答案
-                            if clean_answer and len(clean_answer) > 10:
+                            if clean_answer and len(clean_answer) > 10 and self._should_cache_response(clean_answer):
                                 self.cache_manager.set(f"deep:{query}", clean_answer, thread_id=thread_id)
                             yield clean_answer
                         else:
                             # 没有思考标记，直接使用
-                            if final_answer and len(final_answer) > 10:
+                            if final_answer and len(final_answer) > 10 and self._should_cache_response(final_answer):
                                 self.cache_manager.set(f"deep:{query}", final_answer, thread_id=thread_id)
                             yield final_answer
                     else:
@@ -408,7 +414,10 @@ class DeepResearchAgent(BaseAgent):
         keywords = self.research_tool.extract_keywords(query)
         
         # 构建查询参数
-        entities = keywords.get("high_level", []) + keywords.get("low_level", [])
+        entities = (
+            self._normalize_keywords(keywords.get("high_level", []))
+            + self._normalize_keywords(keywords.get("low_level", []))
+        )
         entities = entities[:3]  # 最多使用3个实体
         
         # 准备探索参数

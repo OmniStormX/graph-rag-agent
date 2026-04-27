@@ -77,8 +77,12 @@ class GraphAgent(BaseAgent):
                 keywords = json.loads(json_match.group(1))
                 if not isinstance(keywords, dict):
                     keywords = {}
-                keywords.setdefault("low_level", [])
-                keywords.setdefault("high_level", [])
+                keywords["low_level"] = self._normalize_keywords(
+                    keywords.get("low_level", [])
+                )
+                keywords["high_level"] = self._normalize_keywords(
+                    keywords.get("high_level", [])
+                )
                 self._keyword_cache[query] = keywords
                 return keywords
         except Exception as e:
@@ -243,7 +247,10 @@ class GraphAgent(BaseAgent):
         if hasattr(messages[-3], "additional_kwargs") and messages[-3].additional_kwargs:
             kw_data = messages[-3].additional_kwargs.get("keywords", {})
             if isinstance(kw_data, dict):
-                keywords = kw_data.get("low_level", []) + kw_data.get("high_level", [])
+                keywords = (
+                    self._normalize_keywords(kw_data.get("low_level", []))
+                    + self._normalize_keywords(kw_data.get("high_level", []))
+                )
 
         if not keywords:
             keywords = [word for word in question.lower().split() if len(word) > 2]
@@ -272,7 +279,7 @@ class GraphAgent(BaseAgent):
         docs = messages[-1].content
 
         global_result = self.global_cache_manager.get(question)
-        if self._is_valid_text_response(global_result):
+        if self._should_cache_response(global_result):
             self._log_execution(
                 "generate",
                 {"question": question, "docs_length": len(docs)},
@@ -282,7 +289,7 @@ class GraphAgent(BaseAgent):
 
         thread_id = state.get("configurable", {}).get("thread_id", "default")
         cached_result = self.cache_manager.get(question, thread_id=thread_id)
-        if self._is_valid_text_response(cached_result):
+        if self._should_cache_response(cached_result):
             self._log_execution(
                 "generate",
                 {"question": question, "docs_length": len(docs)},
@@ -290,6 +297,14 @@ class GraphAgent(BaseAgent):
             )
             self.global_cache_manager.set(question, cached_result)
             return {"messages": [AIMessage(content=cached_result)]}
+
+        if self._is_negative_or_empty_response(docs):
+            self._log_execution(
+                "generate",
+                {"question": question, "docs_length": len(docs), "empty_retrieval": True},
+                docs,
+            )
+            return {"messages": [AIMessage(content=docs)]}
 
         prompt = ChatPromptTemplate.from_messages([
             ("system", LC_SYSTEM_PROMPT),
@@ -302,7 +317,7 @@ class GraphAgent(BaseAgent):
             "response_type": response_type,
         })
 
-        if response and len(response) > 10:
+        if response and len(response) > 10 and self._should_cache_response(response):
             self.cache_manager.set(question, response, thread_id=thread_id)
             self.global_cache_manager.set(question, response)
 
@@ -321,7 +336,7 @@ class GraphAgent(BaseAgent):
         """优先处理可直接执行的物性计算请求。"""
         direct_answer = self._try_direct_fluid_answer(query.strip())
         if direct_answer:
-            if len(direct_answer) > 10:
+            if len(direct_answer) > 10 and self._should_cache_response(direct_answer):
                 self.cache_manager.set(query.strip(), direct_answer, thread_id=thread_id)
                 self.global_cache_manager.set(query.strip(), direct_answer)
             return direct_answer
@@ -334,7 +349,7 @@ class GraphAgent(BaseAgent):
         if direct_answer:
             yield self._make_stage_event("fluid_property_calc", "正在进行流体物性计算", source="direct_tool")
             yield direct_answer
-            if len(direct_answer) > 10:
+            if len(direct_answer) > 10 and self._should_cache_response(direct_answer):
                 self.cache_manager.set(safe_query, direct_answer, thread_id=thread_id)
                 self.global_cache_manager.set(safe_query, direct_answer)
             return
@@ -349,13 +364,21 @@ class GraphAgent(BaseAgent):
 
         cache_key = f"reduce:{question}"
         cached_result = self.cache_manager.get(cache_key)
-        if self._is_valid_text_response(cached_result):
+        if self._should_cache_response(cached_result):
             self._log_execution(
                 "reduce",
                 {"question": question, "docs_length": len(docs)},
                 cached_result,
             )
             return {"messages": [AIMessage(content=cached_result)]}
+
+        if self._is_negative_or_empty_response(docs):
+            self._log_execution(
+                "reduce",
+                {"question": question, "docs_length": len(docs), "empty_retrieval": True},
+                docs,
+            )
+            return {"messages": [AIMessage(content=docs)]}
 
         reduce_prompt = ChatPromptTemplate.from_messages([
             ("system", REDUCE_SYSTEM_PROMPT),
@@ -368,7 +391,8 @@ class GraphAgent(BaseAgent):
             "response_type": response_type,
         })
 
-        self.cache_manager.set(cache_key, response)
+        if self._should_cache_response(response):
+            self.cache_manager.set(cache_key, response)
         self._log_execution(
             "reduce",
             {"question": question, "docs_length": len(docs)},
@@ -385,6 +409,15 @@ class GraphAgent(BaseAgent):
             docs = messages[-1].content if messages[-1] else "未找到相关信息"
         except Exception as e:
             yield f"获取问题或文档时出错: {str(e)}"
+            return
+
+        if self._is_negative_or_empty_response(docs):
+            yield docs
+            self._log_execution(
+                "generate",
+                {"question": question, "docs_length": len(docs), "empty_retrieval": True},
+                docs,
+            )
             return
 
         thread_id = state.get("configurable", {}).get("thread_id", "default")
@@ -407,14 +440,14 @@ class GraphAgent(BaseAgent):
             yield text
 
         response = "".join(response_chunks).strip()
-        if response:
+        if self._should_cache_response(response):
             self.cache_manager.set(question, response, thread_id=thread_id)
             self.global_cache_manager.set(question, response)
-            self._log_execution(
-                "generate",
-                {"question": question, "docs_length": len(docs)},
-                response,
-            )
+        self._log_execution(
+            "generate",
+            {"question": question, "docs_length": len(docs)},
+            response,
+        )
 
     async def _reduce_node_stream(self, state: Dict[str, Any]) -> AsyncGenerator[str, None]:
         """基于流式模型归纳全局搜索结果。"""
@@ -424,9 +457,18 @@ class GraphAgent(BaseAgent):
 
         cache_key = f"reduce:{question}"
         cached_result = self.cache_manager.get(cache_key)
-        if self._is_valid_text_response(cached_result):
+        if self._should_cache_response(cached_result):
             async for chunk in self._replay_text_stream(cached_result):
                 yield chunk
+            return
+
+        if self._is_negative_or_empty_response(docs):
+            yield docs
+            self._log_execution(
+                "reduce",
+                {"question": question, "docs_length": len(docs), "empty_retrieval": True},
+                docs,
+            )
             return
 
         reduce_prompt = ChatPromptTemplate.from_messages([
@@ -448,13 +490,13 @@ class GraphAgent(BaseAgent):
             yield text
 
         response = "".join(response_chunks).strip()
-        if response:
+        if self._should_cache_response(response):
             self.cache_manager.set(cache_key, response)
-            self._log_execution(
-                "reduce",
-                {"question": question, "docs_length": len(docs)},
-                response,
-            )
+        self._log_execution(
+            "reduce",
+            {"question": question, "docs_length": len(docs)},
+            response,
+        )
 
     def _route_stream_after_retrieval(self, state: Dict[str, Any]) -> str:
         """流式路径与非流式路径保持相同的检索后路由。"""

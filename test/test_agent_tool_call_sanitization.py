@@ -108,6 +108,36 @@ class AgentToolCallSanitizationTest(unittest.TestCase):
             },
         )
 
+    def test_negative_empty_answers_are_not_cacheable(self) -> None:
+        """无证据兜底回答不应写入缓存，避免构建后继续命中旧答案。"""
+        self.assertTrue(
+            self.agent._is_negative_or_empty_response(
+                "当前未提供任何分析报告，因此无法确定具体的分析对象。"
+            )
+        )
+        self.assertFalse(
+            self.agent._should_cache_response(
+                "当前知识库没有检索到可支持回答的文档证据。"
+            )
+        )
+        self.assertTrue(
+            self.agent._should_cache_response(
+                "压强属于强度参数，因为它不随系统质量或体积整体缩放而线性相加。"
+            )
+        )
+
+    def test_normalize_keywords_flattens_nested_model_output(self) -> None:
+        """模型返回嵌套关键词时应扁平化为字符串，避免 lower 调用失败。"""
+        self.assertEqual(
+            self.agent._normalize_keywords(
+                {
+                    "low_level": [["广延参数", "强度参数"], "状态参数"],
+                    "high_level": ("热力学", None),
+                }
+            ),
+            ["广延参数", "强度参数", "状态参数", "热力学"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
