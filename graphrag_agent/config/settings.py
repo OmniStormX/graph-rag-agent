@@ -266,18 +266,42 @@ NEO4J_CONFIG = {
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "")
 OPENAI_LLM_MODEL = os.getenv("OPENAI_LLM_MODEL") or None
-LLM_TEMPERATURE = _get_env_float("TEMPERATURE", None)
-LLM_MAX_TOKENS = _get_env_int("MAX_TOKENS", None)
 
-# embedding 配置从通用 OpenAI 配置中独立拆出，便于接入 Qwen 等兼容接口。
-# 若未显式配置 EMBEDDING_*，则回退到原有 OPENAI_* 配置，保持向后兼容。
-EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY") or OPENAI_API_KEY
-EMBEDDING_BASE_URL = os.getenv("EMBEDDING_BASE_URL") or OPENAI_BASE_URL
+# Chat 与 Embedding 使用独立配置；OPENAI_* 仅作为历史兼容兜底。
+CHAT_API_KEY = (
+    os.getenv("CHAT_API_KEY")
+    or os.getenv("OPENAI_CHAT_API_KEY")
+    or OPENAI_API_KEY
+)
+CHAT_BASE_URL = (
+    os.getenv("CHAT_BASE_URL")
+    or os.getenv("OPENAI_CHAT_BASE_URL")
+    or OPENAI_BASE_URL
+)
+CHAT_MODEL = (
+    os.getenv("CHAT_MODEL")
+    or OPENAI_LLM_MODEL
+    or None
+)
+
+EMBEDDING_API_KEY = (
+    os.getenv("EMBEDDING_API_KEY")
+    or os.getenv("OPENAI_EMBEDDING_API_KEY")
+    or OPENAI_API_KEY
+)
+EMBEDDING_BASE_URL = (
+    os.getenv("EMBEDDING_BASE_URL")
+    or os.getenv("OPENAI_EMBEDDING_BASE_URL")
+    or OPENAI_BASE_URL
+)
 EMBEDDING_MODEL = (
     os.getenv("EMBEDDING_MODEL")
+    or os.getenv("OPENAI_EMBEDDING_MODEL")
     or os.getenv("OPENAI_EMBEDDINGS_MODEL")
     or None
 )
+LLM_TEMPERATURE = _get_env_float("TEMPERATURE", None)
+LLM_MAX_TOKENS = _get_env_int("MAX_TOKENS", None)
 
 OPENAI_EMBEDDING_CONFIG = {
     "model": EMBEDDING_MODEL,
@@ -286,11 +310,11 @@ OPENAI_EMBEDDING_CONFIG = {
 }
 
 OPENAI_LLM_CONFIG = {
-    "model": OPENAI_LLM_MODEL,
+    "model": CHAT_MODEL,
     "temperature": LLM_TEMPERATURE,
     "max_tokens": LLM_MAX_TOKENS,
-    "api_key": OPENAI_API_KEY,
-    "base_url": OPENAI_BASE_URL,
+    "api_key": CHAT_API_KEY,
+    "base_url": CHAT_BASE_URL,
 }
 
 # ===== 相似实体检测参数 =====

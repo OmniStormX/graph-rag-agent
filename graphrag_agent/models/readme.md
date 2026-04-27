@@ -56,9 +56,13 @@ asyncio.run(main())
 ### 配置说明
 
 模块依赖以下环境变量：
-- `OPENAI_API_KEY`: OpenAI API 密钥
-- `OPENAI_BASE_URL`: API 基础 URL (可配置为代理或自定义端点)
-- `OPENAI_EMBEDDINGS_MODEL`: 使用的嵌入模型名称
-- `OPENAI_LLM_MODEL`: 使用的语言模型名称
+- `CHAT_API_KEY`: Chat 模型 API 密钥
+- `CHAT_BASE_URL`: Chat 模型 OpenAI 兼容 API 地址
+- `CHAT_MODEL`: Chat 模型名称
+- `EMBEDDING_API_KEY`: Embedding 模型 API 密钥
+- `EMBEDDING_BASE_URL`: Embedding 模型 OpenAI 兼容 API 地址
+- `EMBEDDING_MODEL`: Embedding 模型名称
+- `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_LLM_MODEL`: 旧版兜底配置
+- `OPENAI_EMBEDDING_MODEL` / `OPENAI_EMBEDDINGS_MODEL`: 旧版 Embedding 模型名兜底配置
 - `TEMPERATURE`: 模型温度参数
 - `MAX_TOKENS`: 最大生成token数

@@ -81,3 +81,7 @@ docker-stop:
 docker-status:
 	@echo "当前 Docker 服务状态，Compose 文件: $(DOCKER_COMPOSE_FILE)"
 	@$(DOCKER_COMPOSE) ps
+
+
+docker-clear:
+	docker compose -f docker-compose.image.yaml down -v

@@ -53,9 +53,9 @@ class CompatibleEmbeddings:
         if not model:
             raise ValueError("未配置 EMBEDDING_MODEL 或 OPENAI_EMBEDDINGS_MODEL")
         if not api_key:
-            raise ValueError("未配置 EMBEDDING_API_KEY 或 OPENAI_API_KEY")
+            raise ValueError("未配置 EMBEDDING_API_KEY、OPENAI_EMBEDDING_API_KEY 或 OPENAI_API_KEY")
         if not base_url:
-            raise ValueError("未配置 EMBEDDING_BASE_URL 或 OPENAI_BASE_URL")
+            raise ValueError("未配置 EMBEDDING_BASE_URL、OPENAI_EMBEDDING_BASE_URL 或 OPENAI_BASE_URL")
 
         self.model = model
         self.client = OpenAI(api_key=api_key, base_url=base_url)

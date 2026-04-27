@@ -128,20 +128,20 @@ textract==1.6.3  # Windows 无需安装
 以下配置为必填项，项目无法运行时需首先检查这些配置：
 
 ```env
-# ===== LLM 模型配置 =====
+# ===== Chat 模型配置 =====
+CHAT_API_KEY = 'sk-chat-xxx'
+CHAT_BASE_URL = 'http://localhost:13000/v1'
+CHAT_MODEL = 'gpt-4o'
+
+# ===== Embedding 模型配置 =====
+EMBEDDING_API_KEY = 'sk-embedding-xxx'
+EMBEDDING_BASE_URL = 'http://localhost:13000/v1'
+EMBEDDING_MODEL = 'text-embedding-v4'
+
+# 旧版兜底配置（可选）
 OPENAI_API_KEY = 'sk-xxx'
 OPENAI_BASE_URL = 'http://localhost:13000/v1'
 OPENAI_LLM_MODEL = 'gpt-4o'
-
-# ===== Embedding 模型配置 =====
-# 若与 LLM 共用同一个兼容网关，可只填写 EMBEDDING_MODEL。
-# 若使用 Qwen Embedding 等独立服务，建议单独配置以下三项。
-EMBEDDING_API_KEY = ''
-EMBEDDING_BASE_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1'
-EMBEDDING_MODEL = 'text-embedding-v4'
-
-# 兼容旧版本配置：未设置 EMBEDDING_MODEL 时，会回退到该值
-OPENAI_EMBEDDINGS_MODEL = 'text-embedding-v4'
 
 # ===== Hugging Face 镜像与缓存配置 =====
 # 当 transformers 需要下载 tokenizer 或模型时，优先走镜像站。

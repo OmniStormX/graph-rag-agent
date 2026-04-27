@@ -98,9 +98,21 @@ class ApiAvailabilityTest(unittest.TestCase):
 
     def test_llm_chat_completion_api_available(self):
         """验证 LLM `chat/completions` 接口可正常响应。"""
-        api_key = self.require_config("OPENAI_API_KEY")
-        base_url = self.require_config("OPENAI_BASE_URL")
-        model = self.require_config("OPENAI_LLM_MODEL")
+        api_key = (
+            self.get_config("CHAT_API_KEY")
+            or self.get_config("OPENAI_CHAT_API_KEY")
+            or self.require_config("OPENAI_API_KEY")
+        )
+        base_url = (
+            self.get_config("CHAT_BASE_URL")
+            or self.get_config("OPENAI_CHAT_BASE_URL")
+            or self.require_config("OPENAI_BASE_URL")
+        )
+        model = (
+            self.get_config("CHAT_MODEL")
+            or self.get_config("OPENAI_LLM_MODEL")
+        )
+        self.assertTrue(model, "缺少必要配置: CHAT_MODEL 或 OPENAI_LLM_MODEL")
         endpoint = self.build_url(base_url, "/chat/completions")
 
         try:
@@ -112,9 +124,11 @@ class ApiAvailabilityTest(unittest.TestCase):
                 },
                 json={
                     "model": model,
-                    "messages": [{"role": "user", "content": "ping"}],
+                    # 使用确定性短问答，避免不同供应商的健康检查响应过长。
+                    "messages": [{"role": "user", "content": "请只回复 pong"}],
                     "temperature": 0,
-                    "max_tokens": 8,
+                    # 推理模型可能先输出 reasoning_content，预算过小时 content 会为空。
+                    "max_tokens": 64,
                 },
                 timeout=30,
             )
@@ -137,10 +151,19 @@ class ApiAvailabilityTest(unittest.TestCase):
 
     def test_embedding_api_available(self):
         """验证 Embedding 接口可正常生成向量。"""
-        api_key = self.get_config("EMBEDDING_API_KEY") or self.require_config("OPENAI_API_KEY")
-        base_url = self.get_config("EMBEDDING_BASE_URL") or self.require_config("OPENAI_BASE_URL")
+        api_key = (
+            self.get_config("EMBEDDING_API_KEY")
+            or self.get_config("OPENAI_EMBEDDING_API_KEY")
+            or self.require_config("OPENAI_API_KEY")
+        )
+        base_url = (
+            self.get_config("EMBEDDING_BASE_URL")
+            or self.get_config("OPENAI_EMBEDDING_BASE_URL")
+            or self.require_config("OPENAI_BASE_URL")
+        )
         model = (
             self.get_config("EMBEDDING_MODEL")
+            or self.get_config("OPENAI_EMBEDDING_MODEL")
             or self.get_config("OPENAI_EMBEDDINGS_MODEL")
         )
         self.assertTrue(

@@ -332,11 +332,20 @@ NEO4J_USERNAME=neo4j
 NEO4J_PASSWORD=your_password
 NEO4J_MAX_POOL_SIZE=20
 
-# LLM配置
+# Chat 模型配置
+CHAT_API_KEY=sk-chat-xxx
+CHAT_BASE_URL=http://localhost:13000/v1
+CHAT_MODEL=gpt-4o
+
+# Embedding 模型配置
+EMBEDDING_API_KEY=sk-embedding-xxx
+EMBEDDING_BASE_URL=http://localhost:13000/v1
+EMBEDDING_MODEL=text-embedding-v4
+
+# 旧版兜底配置（可选）
 OPENAI_API_KEY=sk-xxx
 OPENAI_BASE_URL=http://localhost:13000/v1
 OPENAI_LLM_MODEL=gpt-4o
-OPENAI_EMBEDDINGS_MODEL=text-embedding-v4
 
 # 性能调优
 MAX_WORKERS=8
