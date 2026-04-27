@@ -1,4 +1,20 @@
 services:
+  # 初始化容器：仅针对 bind mount 目录执行顶层 chown，
+  # 确保宿主机自动创建（默认 root:root）的目录对容器内 appuser (UID=1000) 可写。
+  # 不使用 -R 避免 WSL/Docker 在递归修改属主时出现挂载快照竞争，导致主容器看不到文件。
+  # 执行完即退出，app 服务通过 depends_on.service_completed_successfully 等待其完成。
+  app-init:
+    image: busybox:1.36
+    container_name: graph-rag-app-init
+    command: >
+      sh -c "chown 1000:1000 /mnt/files /mnt/datasets /mnt/documents &&
+             echo '[app-init] bind mount 目录属主已修正为 1000:1000'"
+    volumes:
+      - ./files:/mnt/files
+      - ./datasets:/mnt/datasets
+      - ./documents:/mnt/documents
+    restart: "no"
+
   app:
     image: ${GRAPH_RAG_IMAGE:-ghcr.io/omnistormx/graph-rag-app:graphRAG-CSU}
     container_name: graph-rag-app
@@ -21,13 +37,18 @@ services:
       - "8501:8501"
       - "8502:8502"
     volumes:
-      # 运行产物挂载到宿主机，升级镜像时保留缓存、上传文件和图快照。
-      - ./cache:/app/cache
+      # 缓存与运行时目录改为 named volume：由 Docker 管理属主，
+      # 避免 WSL / Windows 文件系统下 bind mount 的属主和性能问题。
+      # 如需查看/清理：docker volume inspect graph_rag_cache
+      - graph_rag_cache:/app/cache
+      - graph_rag_runtime:/app/runtime
+      # 用户上传与语料目录保留 bind mount，便于宿主机直接放置/备份文件。
       - ./files:/app/files
-      - ./runtime:/app/runtime
       - ./datasets:/app/datasets
       - ./documents:/app/documents
     depends_on:
+      app-init:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       neo4j:
@@ -107,6 +128,9 @@ services:
     restart: unless-stopped
 
 volumes:
+  # 由 Docker 管理，属主自动匹配镜像的 appuser，无需手动 chown
+  graph_rag_cache:
+  graph_rag_runtime:
   neo4j_data:
   neo4j_logs:
   neo4j_plugins:
